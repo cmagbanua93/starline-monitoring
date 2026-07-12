@@ -124,12 +124,34 @@ const sseClients = new Set();
 
 // ---------- Router API ----------
 
+const ROUTER_FETCH_TIMEOUT_MS = parseInt(process.env.MIKROTIK_FETCH_TIMEOUT_MS || '8000');
+
+// Node's fetch collapses DNS failures, connection refused, TLS errors, and
+// timeouts into one generic "fetch failed" message. The real reason lives
+// in err.cause — surface it so poll errors are actually actionable
+// (especially useful when the router sits behind a relay/port-forward,
+// where "fetch failed" could mean the relay is down, the port isn't
+// actually forwarded, or the router's web service is unreachable).
+function describeFetchError(err) {
+  const cause = err && err.cause;
+  if (err && err.name === 'TimeoutError') return `timed out after ${ROUTER_FETCH_TIMEOUT_MS}ms connecting to ${MIKROTIK_HOST}:${MIKROTIK_PORT}`;
+  if (cause && cause.code) return `${err.message} — ${cause.code}${cause.message ? ': ' + cause.message : ''}`;
+  if (cause && cause.message) return `${err.message} — ${cause.message}`;
+  return err ? err.message : String(err);
+}
+
 async function routerGet(endpoint) {
-  const res = await fetch(`${BASE_URL}${endpoint}`, {
-    headers: {
-      'Authorization': 'Basic ' + Buffer.from(`${MIKROTIK_USER}:${MIKROTIK_PASSWORD}`).toString('base64'),
-    },
-  });
+  let res;
+  try {
+    res = await fetch(`${BASE_URL}${endpoint}`, {
+      headers: {
+        'Authorization': 'Basic ' + Buffer.from(`${MIKROTIK_USER}:${MIKROTIK_PASSWORD}`).toString('base64'),
+      },
+      signal: AbortSignal.timeout(ROUTER_FETCH_TIMEOUT_MS),
+    });
+  } catch (err) {
+    throw new Error(describeFetchError(err));
+  }
   if (!res.ok) throw new Error(`Router returned HTTP ${res.status} for ${endpoint}`);
   return res.json();
 }
