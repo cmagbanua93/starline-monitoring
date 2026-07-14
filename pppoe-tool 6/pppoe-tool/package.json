@@ -1,0 +1,21 @@
+{
+  "name": "mikrotik-pppoe-provisioner",
+  "version": "1.0.0",
+  "description": "Bulk-create/update PPPoE secrets on a Mikrotik router from a spreadsheet, via RouterOS REST API",
+  "main": "monitor.js",
+  "scripts": {
+    "start": "node monitor.js",
+    "provision": "node create_pppoe_accounts.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "exceljs": "^4.4.0",
+    "node-ssh": "^13.2.0"
+  },
+  "overrides": {
+    "uuid": "^11.1.1"
+  }
+}
