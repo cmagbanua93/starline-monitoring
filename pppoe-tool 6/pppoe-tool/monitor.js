@@ -56,7 +56,6 @@
 
 require('dotenv').config();
 const http = require('http');
-const { exec } = require('child_process');
 const { NodeSSH } = require('node-ssh');
 
 // ---------- Config ----------
@@ -367,16 +366,45 @@ function extractAccount(cells) {
 // Pings each ISP gateway IP directly from this machine (shells out to the OS
 // ping command — works cross-platform without needing raw-socket permissions).
 
+// ICMP ping needs a raw socket, which most containerized hosts (Railway
+// included) don't grant — child_process.exec('ping ...') just fails there
+// regardless of whether the target is actually reachable, which is why
+// every ISP link used to show offline once this ran in the cloud. A plain
+// TCP connect attempt needs no special privileges: a real connection, or
+// even an immediate "connection refused" (a TCP RST — the host is there,
+// it just isn't listening on that exact port), both prove the host
+// answered. Only a timeout counts as unreachable. Tries a few common
+// ports since we don't know what's actually listening on these gateways.
 function pingHost(ip, timeoutMs = ISP_PING_TIMEOUT_MS) {
-  return new Promise((resolve) => {
-    const isWin = process.platform === 'win32';
-    const cmd = isWin ? `ping -n 1 -w ${timeoutMs} ${ip}` : `ping -c 1 ${ip}`;
+  const net = require('net');
+  const PORTS = [443, 80, 53, 22];
 
-    exec(cmd, { timeout: timeoutMs + 1000 }, (err, stdout) => {
-      if (err) { resolve({ online: false, latencyMs: null }); return; }
-      const match = stdout.match(/time[=<]\s*([\d.]+)\s*ms/i);
-      resolve({ online: true, latencyMs: match ? parseFloat(match[1]) : null });
-    });
+  return new Promise((resolve) => {
+    const start = Date.now();
+    let i = 0;
+
+    function tryNextPort() {
+      if (i >= PORTS.length) { resolve({ online: false, latencyMs: null }); return; }
+      const port = PORTS[i++];
+      const socket = new net.Socket();
+      let settled = false;
+
+      const finish = (online) => {
+        if (settled) return;
+        settled = true;
+        socket.destroy();
+        if (online) resolve({ online: true, latencyMs: Date.now() - start });
+        else tryNextPort();
+      };
+
+      socket.setTimeout(timeoutMs);
+      socket.once('connect', () => finish(true));
+      socket.once('error', (err) => finish(err && err.code === 'ECONNREFUSED'));
+      socket.once('timeout', () => finish(false));
+      socket.connect(port, ip);
+    }
+
+    tryNextPort();
   });
 }
 
