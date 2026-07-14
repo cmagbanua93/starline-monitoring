@@ -238,9 +238,9 @@ function parseTerse(output) {
 //
 // TaokiNinam is a classic PHP session-cookie app:
 //   1. POST cusername/cpassword to /actions/login_check.php -> PHPSESSID cookie
-//   2. GET /activesP.php and /inactivesP.php (with that cookie) -> full HTML
-//      tables of currently-online and currently-offline PPPoE accounts,
-//      already joined with billing/customer/NAP data server-side.
+//   2. GET /actions/exportRecords.php (with that cookie) -> full customer CSV
+// The CSV's USERNAME column is the same PPPoE secret name used on the
+// router, so it's the join key against the SSH-sourced account list.
 //
 // Used here only to enrich router-sourced accounts with customer name,
 // account number, contact number, area, and NAP box — matched onto the
@@ -284,11 +284,13 @@ async function billingLogin() {
   billingCookie = sessionCookie;
 }
 
-async function fetchSubscriberPage(path) {
+async function billingFetchCsv() {
   if (!billingCookie) await billingLogin();
 
-  const url = `${BILLING_BASE_URL}/${path}`;
-  const doFetch = () => fetch(url, {
+  const exportUrl = `${BILLING_BASE_URL}/actions/exportRecords.php`;
+  if (BILLING_DEBUG) console.log(`[billing debug] GET ${exportUrl} | cookie: ${billingCookie ? billingCookie.split('=')[0] : '(none)'}=***`);
+
+  const doFetch = () => fetch(exportUrl, {
     headers: {
       Cookie: billingCookie,
       'User-Agent': 'Mozilla/5.0 (compatible; monitor.js)',
@@ -304,10 +306,10 @@ async function fetchSubscriberPage(path) {
     throw new Error(describeFetchError(err));
   }
 
-  // Session expired / not logged in -> the subscriber table won't be
-  // present. Re-login once and retry.
-  if (!/id="dataTable"/.test(text)) {
-    if (BILLING_DEBUG) console.log(`[billing debug] ${path} -> status ${res.status}, no dataTable found, re-logging in`);
+  // Session expired / not logged in -> exportRecords.php won't return CSV.
+  // Re-login once and retry.
+  if (!text.trimStart().startsWith('ID,ACCOUNT')) {
+    if (BILLING_DEBUG) console.log(`[billing debug] exportRecords.php -> status ${res.status}, first 200 chars: ${text.slice(0, 200)}`);
     await billingLogin();
     try {
       res = await doFetch();
@@ -315,66 +317,44 @@ async function fetchSubscriberPage(path) {
     } catch (err) {
       throw new Error(describeFetchError(err));
     }
-    if (!/id="dataTable"/.test(text)) {
-      throw new Error(`${path} did not return the subscriber table after re-login (set BILLING_DEBUG=true in .env for more detail)`);
+    if (!text.trimStart().startsWith('ID,ACCOUNT')) {
+      if (BILLING_DEBUG) console.log(`[billing debug] retry exportRecords.php -> status ${res.status}, first 200 chars: ${text.slice(0, 200)}`);
+      throw new Error('billing export did not return CSV — login may have failed (set BILLING_DEBUG=true in .env for more detail)');
     }
   }
 
   return text;
 }
 
-// Splits a TaokiNinam subscriber-table HTML page into an array of rows,
-// each row being an array of raw (still-HTML) cell contents in column
-// order. Column layout (0-indexed) is fixed by the page's <thead>:
-//   0 Account+Name link   1 Recurring Dates   2 Mobile+Area   3 Subscription
-//   4 Billing+Service     5 Credentials       6 Status+Profile 7 Balance
-//   8 Area (full)         9-10 (unused)       11 Inst.Date dup 12 (unused)
-//   13 billing-cycle date 14 local IP (shared) 15 (unused)
-//   16 PON type           17 PON count        18 NAP box       19 NAP port
-//   20-22 (unused)
-function parseSubscriberRows(html) {
+// Minimal RFC4180 CSV parser — handles quoted fields, escaped quotes ("")
+// and embedded newlines inside quoted fields (TaokiNinam's export uses these).
+function parseCsv(text) {
   const rows = [];
-  const trRe = /<tr>([\s\S]*?)<\/tr>/g;
-  let trMatch;
-  while ((trMatch = trRe.exec(html))) {
-    const rowHtml = trMatch[1];
-    const cells = [];
-    const tdRe = /<td[^>]*>([\s\S]*?)<\/td>/g;
-    let tdMatch;
-    while ((tdMatch = tdRe.exec(rowHtml))) cells.push(tdMatch[1]);
-    if (cells.length >= 8) rows.push(cells);
+  let row = [], field = '', inQuotes = false;
+
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (text[i + 1] === '"') { field += '"'; i++; }
+        else { inQuotes = false; }
+      } else {
+        field += c;
+      }
+    } else if (c === '"') {
+      inQuotes = true;
+    } else if (c === ',') {
+      row.push(field); field = '';
+    } else if (c === '\r') {
+      // skip
+    } else if (c === '\n') {
+      row.push(field); rows.push(row); row = []; field = '';
+    } else {
+      field += c;
+    }
   }
+  if (field.length || row.length) { row.push(field); rows.push(row); }
   return rows;
-}
-
-function extractAccount(cells) {
-  const c = i => cells[i] || '';
-
-  const nameBlock  = stripTags(c(0));
-  const accountNo  = (nameBlock.match(/Account:\s*(.*)/)   || [])[1]?.split('\n')[0].trim() || '';
-  const customerName = (nameBlock.match(/Name:\s*(.*)/)    || [])[1]?.split('\n')[0].trim() || '';
-
-  const detailsBlock = stripTags(c(2));
-  const contactNo = (detailsBlock.match(/Mobile:\s*([^\n]*)/) || [])[1]?.trim() || '';
-  const visibleArea = (detailsBlock.match(/Area:\s*([^\n]*)/) || [])[1]?.trim() || '';
-
-  const secretMatch = c(5).match(/<span class="text-info">([^<]*)<\/span>/);
-  const username = secretMatch ? secretMatch[1].trim() : '';
-
-  const statusBlock = stripTags(c(6));
-  const profile = (statusBlock.match(/Profile:\s*([^\n]*)/) || [])[1]?.trim() || '';
-
-  const hiddenArea = stripTags(c(8));
-  const area = hiddenArea || visibleArea;
-
-  const napType = stripTags(c(16));
-  const napPort = stripTags(c(19));
-  const napBoxText = stripTags(c(18));
-  const napBox = [napBoxText, napPort].filter(Boolean).join(' / ') || napType;
-
-  if (!username) return null;
-
-  return { username, customerName, accountNo, contactNo, area, profile, napBox };
 }
 
 // ---------- ISP uplink monitoring ----------
@@ -471,21 +451,51 @@ function parseRouterOsTime(raw) {
   return null;
 }
 
-// Fetches TaokiNinam's online/offline pages purely for customer-info
-// enrichment. Never throws — a failure here just means blank customer
-// fields, since router status/timestamps don't depend on it.
+// Fetches TaokiNinam's customer CSV export purely for enrichment. Never
+// throws — a failure here just means blank customer fields, since router
+// status/timestamps don't depend on it. Keyed by lowercased username so
+// the join with the router's PPPoE secret name is case-insensitive.
 async function fetchBillingEnrichment() {
   if (!BILLING_ENABLED) return { map: new Map(), error: null };
   try {
-    const [onlineHtml, offlineHtml] = await Promise.all([
-      fetchSubscriberPage('activesP.php'),
-      fetchSubscriberPage('inactivesP.php'),
-    ]);
-    const rows = [
-      ...parseSubscriberRows(onlineHtml).map(extractAccount).filter(Boolean),
-      ...parseSubscriberRows(offlineHtml).map(extractAccount).filter(Boolean),
-    ];
-    return { map: new Map(rows.map(r => [r.username, r])), error: null };
+    const csvText = await billingFetchCsv();
+    const rows = parseCsv(csvText);
+    if (!rows.length) throw new Error('billing export returned no rows');
+
+    const header = rows[0];
+    const col = name => header.indexOf(name);
+    const iAccount  = col('ACCOUNT');
+    const iFname    = col('FNAME');
+    const iLname    = col('LNAME');
+    const iArea     = col('AREA');
+    const iPhone    = col('PHONE');
+    const iUsername = col('USERNAME');
+    const iNap      = col('NAP');
+    const iPort     = col('PORT');
+
+    if (iUsername === -1) throw new Error('billing export missing USERNAME column');
+
+    const map = new Map();
+    for (let r = 1; r < rows.length; r++) {
+      const row = rows[r];
+      const username = (row[iUsername] || '').trim();
+      if (!username) continue;
+
+      const fname = (row[iFname] || '').trim();
+      const lname = (row[iLname] || '').trim();
+      const nap   = (row[iNap]   || '').trim();
+      const port  = (row[iPort]  || '').trim();
+
+      map.set(username.toLowerCase(), {
+        accountNo:    (row[iAccount] || '').trim(),
+        customerName: [fname, lname].filter(Boolean).join(' '),
+        contactNo:    (row[iPhone] || '').trim(),
+        area:         (row[iArea] || '').trim(),
+        napBox:       [nap, port].filter(Boolean).join(' / '),
+      });
+    }
+
+    return { map, error: null };
   } catch (err) {
     return { map: new Map(), error: describeFetchError(err) };
   }
@@ -539,7 +549,7 @@ async function pollRouter() {
         }
       }
 
-      const enrich = enrichment.map.get(username) || {};
+      const enrich = enrichment.map.get(username.toLowerCase()) || {};
 
       updated.push({
         username,
@@ -884,6 +894,35 @@ tbody td { padding:9px 12px; color:#9aa3bc; vertical-align:middle; }
 #error-bar { display:none; background:#7f1d1d; color:#fca5a5; padding:9px 24px; font-size:12px; }
 #error-bar.active { display:block; }
 #no-results { text-align:center; color:var(--dim); padding:36px; font-size:13px; }
+
+/* ---- Mobile ---- */
+@media (max-width: 900px) {
+  .overview-panel { grid-template-columns: 1fr; }
+  .live-card { min-height: 240px; padding: 20px; }
+}
+@media (max-width: 640px) {
+  .sidebar { width: 44px; padding: 8px 0; }
+  .slogo { font-size: 16px; padding: 6px 0 10px; }
+  .snav { width: 32px; height: 32px; font-size: 15px; }
+  .snav .stip { display: none !important; }
+  .topbar { padding: 10px 12px; }
+  .topbar h1 { font-size: 14px; gap: 5px; }
+  .topbar h1 span { display: none; }
+  .topbar .meta { font-size: 10px; gap: 8px 12px; }
+  .content { padding: 12px 10px 24px; gap: 14px; }
+  .isp-panel { grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; }
+  .isp-card { padding: 12px 14px; }
+  .history-grid { grid-template-columns: 1fr; grid-template-rows: none; gap: 10px; }
+  .lc-donut-wrap svg { width: 140px; height: 140px; }
+  .lc-stats { gap: 22px; }
+  .lc-big-num { font-size: 36px; }
+  .lc-stat-n { font-size: 24px; }
+  .toolbar { gap: 6px; }
+  .tb-input { width: 100%; flex: 1 1 100%; }
+  .tb-select { flex: 1 1 auto; }
+  table { font-size: 11px; }
+  thead th, tbody td { padding: 7px 8px; }
+}
 </style>
 </head>
 <body>
