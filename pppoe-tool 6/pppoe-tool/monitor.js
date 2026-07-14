@@ -74,6 +74,21 @@ const SSH_USER     = process.env.MIKROTIK_SSH_USER;
 const SSH_PASSWORD = process.env.MIKROTIK_SSH_PASSWORD;
 const SSH_TIMEOUT_MS = parseInt(process.env.MIKROTIK_SSH_TIMEOUT_MS || '15000');
 
+// The router prints its own local time (whatever /system clock time-zone is
+// set to on the router — Philippines/Manila = UTC+8), regardless of what
+// timezone the machine running monitor.js is in. Running locally in the
+// Philippines, that happened to match by coincidence; running on a cloud
+// host like Railway (usually UTC), it silently doesn't. This offset lets
+// us convert the router's wall-clock reading to the correct UTC instant
+// instead of misreading it as the server's own local time.
+function parseTzOffsetToMinutes(raw) {
+  const m = String(raw || '').trim().match(/^([+-])(\d{1,2}):?(\d{2})?$/);
+  if (!m) return 8 * 60; // default: Philippines (UTC+8)
+  const sign = m[1] === '-' ? -1 : 1;
+  return sign * (parseInt(m[2], 10) * 60 + (m[3] ? parseInt(m[3], 10) : 0));
+}
+const MIKROTIK_TZ_OFFSET_MIN = parseTzOffsetToMinutes(process.env.MIKROTIK_TZ_OFFSET || '+08:00');
+
 if (!SSH_HOST || !SSH_USER || !SSH_PASSWORD) {
   console.error('Missing MIKROTIK_SSH_HOST, MIKROTIK_SSH_USER or MIKROTIK_SSH_PASSWORD in .env — these are required (monitor.js talks to the router over SSH).');
   process.exit(1);
@@ -424,21 +439,34 @@ const MONTH_ABBR = { jan:0, feb:1, mar:2, apr:3, may:4, jun:5, jul:6, aug:7, sep
 // RouterOS renders date/time fields in a couple of formats depending on
 // context: "YYYY-MM-DD HH:MM:SS", "mon/dd/yyyy HH:MM:SS", or just
 // "HH:MM:SS" for something that happened earlier today.
+// Converts router-local wall-clock components (Y, M[0-idx], D, h, m, s) to
+// the correct UTC instant, using MIKROTIK_TZ_OFFSET_MIN — NOT new Date(y,m,
+// d,h,mi,s), which silently uses the server process's own local timezone.
+function routerLocalToUtc(year, month, day, hour, min, sec) {
+  return new Date(Date.UTC(year, month, day, hour, min, sec) - MIKROTIK_TZ_OFFSET_MIN * 60000);
+}
+
+// Returns "today" as the router's clock would see it (its configured
+// timezone may differ from the server's), for the short "HH:MM:SS" form.
+function todayInRouterTz() {
+  const shifted = new Date(Date.now() + MIKROTIK_TZ_OFFSET_MIN * 60000);
+  return { year: shifted.getUTCFullYear(), month: shifted.getUTCMonth(), day: shifted.getUTCDate() };
+}
+
 function parseRouterOsTime(raw) {
   if (!raw) return null;
   const iso = raw.match(/^(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2}):(\d{2})$/);
-  if (iso) return new Date(`${iso[1]}-${iso[2]}-${iso[3]}T${iso[4]}:${iso[5]}:${iso[6]}`);
+  if (iso) return routerLocalToUtc(+iso[1], +iso[2] - 1, +iso[3], +iso[4], +iso[5], +iso[6]);
   const todayOnly = raw.match(/^(\d{2}):(\d{2}):(\d{2})$/);
   if (todayOnly) {
-    const d = new Date();
-    d.setHours(+todayOnly[1], +todayOnly[2], +todayOnly[3], 0);
-    return d;
+    const { year, month, day } = todayInRouterTz();
+    return routerLocalToUtc(year, month, day, +todayOnly[1], +todayOnly[2], +todayOnly[3]);
   }
   const full = raw.match(/^([a-z]{3})\/(\d{1,2})\/(\d{4})\s+(\d{2}):(\d{2}):(\d{2})$/i);
   if (full) {
     const month = MONTH_ABBR[full[1].toLowerCase()];
     if (month === undefined) return null;
-    return new Date(+full[3], month, +full[2], +full[4], +full[5], +full[6]);
+    return routerLocalToUtc(+full[3], month, +full[2], +full[4], +full[5], +full[6]);
   }
   return null;
 }
