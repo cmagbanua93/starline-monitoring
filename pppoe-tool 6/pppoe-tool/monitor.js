@@ -5,12 +5,11 @@
  *
  * Online/offline status and exact "logged out at" timestamps come directly
  * from the Mikrotik router itself, over SSH — monitor.js runs `/ppp active
- * print` and `/ppp secret print` (and `/log print` for exact log-sourced
- * logout times) on the router's CLI via an SSH connection. This works from
- * anywhere, including cloud hosts like Railway, as long as the router's SSH
- * port is reachable — for StarLine that's the remote-access provider's
- * relayed SSH port (remoteanyx888.jrandombytes.com:26248), the same port
- * TaokiNinam itself uses to reach the router.
+ * print` and `/ppp secret print` on the router's CLI via an SSH connection.
+ * This works from anywhere, including cloud hosts like Railway, as long as
+ * the router's SSH port is reachable — for StarLine that's the remote-access
+ * provider's relayed SSH port (remoteanyx888.jrandombytes.com:26248), the
+ * same port TaokiNinam itself uses to reach the router.
  *
  * Customer info (name, account number, contact number, area, NAP box) is
  * an OPTIONAL enrichment layer sourced from the TaokiNinam billing system
@@ -19,12 +18,12 @@
  * still works fine — those fields are just left blank. Router status/
  * timestamps never depend on TaokiNinam being up.
  *
- * "Logged out at" times: monitor.js first tries to find an exact timestamp
- * for the account in the router's own log (topics containing "ppp"). If no
- * matching log entry is found (log buffer is small and rotates), it falls
- * back to recording the time monitor.js itself first observed the account
- * go offline (accurate to one poll interval). The dashboard tags each time
- * as LOG (exact) or POLL (detected) accordingly.
+ * "Logged out at" times come straight from each PPP secret's own
+ * "last-logged-out" field (the same value Winbox shows under PPP > Secrets
+ * > Last Logged Out) — no log-scraping or guesswork involved. If that field
+ * is ever empty, it falls back to recording the time monitor.js itself
+ * first observed the account go offline. The dashboard tags each time as
+ * SECRET (from the router) or POLL (detected locally) accordingly.
  *
  * Also monitors ISP uplinks by pinging their gateway IPs directly from
  * this machine (edit the ISP_LINKS array below to add/remove/rename links).
@@ -201,11 +200,13 @@ function parseTerse(output) {
   for (const rawLine of lines) {
     let line = rawLine.trim();
     if (!line || !/^\d+\s/.test(line)) continue; // skip blank lines / anything not starting with a record index
-    // RouterOS emits the log's `time` field unquoted but with an embedded
-    // space for older entries (e.g. `time=jul/12/2026 09:10:00`), which
-    // breaks the generic key=value split below — normalize it to a quoted
-    // value first so it parses as one field instead of two.
-    line = line.replace(/time=([a-z]{3}\/\d{1,2}\/\d{4}) (\d{2}:\d{2}:\d{2})/i, 'time="$1 $2"');
+    // RouterOS emits date/time fields unquoted but with an embedded space
+    // (e.g. `time=jul/12/2026 09:10:00` or `last-logged-out=jul/12/2026
+    // 09:10:00`), which breaks the generic key=value split below —
+    // normalize any such field to a quoted value first so it parses as
+    // one field instead of two.
+    line = line.replace(/([\w-]+)=([a-z]{3}\/\d{1,2}\/\d{4}) (\d{2}:\d{2}:\d{2})/gi, '$1="$2 $3"');
+    line = line.replace(/([\w-]+)=(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2})/g, '$1="$2 $3"');
     const fields = {};
     const fieldRe = /(\S+?)=("(?:[^"\\]|\\.)*"|\S*)/g;
     let m;
@@ -392,10 +393,13 @@ async function pollIsps() {
 
 const MONTH_ABBR = { jan:0, feb:1, mar:2, apr:3, may:4, jun:5, jul:6, aug:7, sep:8, oct:9, nov:10, dec:11 };
 
-// RouterOS log timestamps are either "HH:MM:SS" (today) or
-// "mon/dd/yyyy HH:MM:SS" (older entries).
-function parseRouterOsLogTime(raw) {
+// RouterOS renders date/time fields in a couple of formats depending on
+// context: "YYYY-MM-DD HH:MM:SS", "mon/dd/yyyy HH:MM:SS", or just
+// "HH:MM:SS" for something that happened earlier today.
+function parseRouterOsTime(raw) {
   if (!raw) return null;
+  const iso = raw.match(/^(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2}):(\d{2})$/);
+  if (iso) return new Date(`${iso[1]}-${iso[2]}-${iso[3]}T${iso[4]}:${iso[5]}:${iso[6]}`);
   const todayOnly = raw.match(/^(\d{2}):(\d{2}):(\d{2})$/);
   if (todayOnly) {
     const d = new Date();
@@ -407,23 +411,6 @@ function parseRouterOsLogTime(raw) {
     const month = MONTH_ABBR[full[1].toLowerCase()];
     if (month === undefined) return null;
     return new Date(+full[3], month, +full[2], +full[4], +full[5], +full[6]);
-  }
-  return null;
-}
-
-// Best-effort match: scans /log entries (newest first) for one mentioning
-// this username alongside a disconnect-ish keyword. Router log message
-// wording varies by RouterOS version/config, so this may need tuning to
-// your router's actual log phrasing — anything not matched here still
-// falls back to the poll-detected timestamp, so nothing breaks either way.
-const LOGOUT_KEYWORDS = /logged out|terminat|disconnect|timed?\s*out/i;
-function findLogoutTimeFromLog(username, logRows) {
-  for (let i = logRows.length - 1; i >= 0; i--) {
-    const msg = logRows[i].message || '';
-    if (!msg.includes(username)) continue;
-    if (!LOGOUT_KEYWORDS.test(msg)) continue;
-    const t = parseRouterOsLogTime(logRows[i].time);
-    if (t) return t;
   }
   return null;
 }
@@ -450,15 +437,13 @@ async function fetchBillingEnrichment() {
 
 async function pollRouter() {
   try {
-    const [activeOut, secretOut, logOut] = await Promise.all([
+    const [activeOut, secretOut] = await Promise.all([
       sshExec('/ppp active print terse'),
       sshExec('/ppp secret print terse'),
-      sshExec('/log print terse'),
     ]);
 
     const activeByName = new Map(parseTerse(activeOut).map(r => [r.name, r]));
     const secretRows   = parseTerse(secretOut);
-    const logRows      = parseTerse(logOut);
 
     const now = new Date();
     const prevByUsername = new Map(state.accounts.map(a => [a.username, a]));
@@ -474,13 +459,28 @@ async function pollRouter() {
       const prev     = prevByUsername.get(username);
       const justWentOffline = !isOnline && prev && prev.status === 'online';
 
-      let lastLogout = !isOnline ? (prev ? prev.lastLogout : null) : null;
-      let logSource  = !isOnline ? (prev ? prev.logSource : null) : null;
-
-      if (!isOnline && !lastLogout) {
-        const logTime = findLogoutTimeFromLog(username, logRows);
-        if (logTime)          { lastLogout = logTime.toISOString(); logSource = 'log'; }
-        else if (justWentOffline) { lastLogout = now.toISOString(); logSource = 'poll'; }
+      // RouterOS tracks this per-secret already — same value shown in
+      // Winbox under PPP > Secrets > Last Logged Out. Far more reliable
+      // than trying to pattern-match /log message text.
+      let lastLogout = null, logSource = null;
+      if (!isOnline) {
+        const parsed = parseRouterOsTime(secret['last-logged-out']);
+        // RouterOS uses the epoch (jan/01/1970) as a sentinel for "this
+        // secret has never logged out" — treat that as no data, not a
+        // real timestamp.
+        if (parsed && parsed.getFullYear() <= 1971) {
+          if (justWentOffline) { lastLogout = now.toISOString(); logSource = 'poll'; }
+          else if (prev) { lastLogout = prev.lastLogout; logSource = prev.logSource; }
+        } else if (parsed) {
+          lastLogout = parsed.toISOString();
+          logSource = 'secret';
+        } else if (justWentOffline) {
+          lastLogout = now.toISOString();
+          logSource = 'poll';
+        } else if (prev) {
+          lastLogout = prev.lastLogout;
+          logSource = prev.logSource;
+        }
       }
 
       const enrich = enrichment.map.get(username) || {};
@@ -819,7 +819,7 @@ tbody td { padding:9px 12px; color:#9aa3bc; vertical-align:middle; }
 .badge.offline::before { background:var(--red); }
 
 .src-tag { display:inline-block; font-size:9px; padding:1px 5px; border-radius:3px; margin-left:5px; font-weight:600; vertical-align:middle; }
-.src-tag.log { background:#1e3a5f; color:#60a5fa; border:1px solid #1e40af; }
+.src-tag.secret { background:#1e3a5f; color:#60a5fa; border:1px solid #1e40af; }
 .src-tag.poll   { background:#2d2a1e; color:#fbbf24; border:1px solid #78350f; }
 
 .mono  { font-family:monospace; font-size:12px; }
@@ -1325,7 +1325,7 @@ function applyDisplay() {
 
   tbody.innerHTML = list.map(a => {
     const src = a.lastLogout
-      ? \`\${fmt(a.lastLogout)} <span class="src-tag \${a.logSource||'poll'}">\${a.logSource==='log'?'LOG':'POLL'}</span>\`
+      ? \`\${fmt(a.lastLogout)} <span class="src-tag \${a.logSource||'poll'}">\${a.logSource==='secret'?'SECRET':'POLL'}</span>\`
       : '—';
     return \`<tr class="\${selectedCard==='live' && a.status==='offline' ? 'new-offline' : ''}">
       <td><span class="badge \${a.status}">\${a.status}</span></td>
@@ -1398,9 +1398,10 @@ Status comes directly from the router (/ppp active, /ppp secret) over SSH.
 Billing enrichment (customer name/account/contact/area/NAP): ${BILLING_ENABLED ? 'ON — ' + BILLING_BASE_URL : 'OFF (TAOKININAM_USERNAME/PASSWORD not set)'}
 
 Offline time source:
-  [LOG]  = exact timestamp found in the router's own /log
-  [POLL] = fallback — first poll where monitor.js itself saw the
-           account go offline (accurate to one poll interval, ${Math.round(POLL_INTERVAL_MS/1000)}s)
+  [SECRET] = the PPP secret's own "last logged out" field (same value
+             shown in Winbox under PPP > Secrets > Last Logged Out)
+  [POLL]   = fallback — first poll where monitor.js itself saw the
+             account go offline (only used if that field is empty)
 `);
   pollRouter();
   setInterval(pollRouter, POLL_INTERVAL_MS);
