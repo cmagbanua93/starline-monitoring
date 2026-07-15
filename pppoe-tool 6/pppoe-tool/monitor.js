@@ -528,7 +528,15 @@ async function pollRouter() {
       // RouterOS tracks this per-secret already — same value shown in
       // Winbox under PPP > Secrets > Last Logged Out. Far more reliable
       // than trying to pattern-match /log message text.
-      let lastLogout = null, logSource = null;
+      //
+      // Carry the previous value forward by default — including while the
+      // account is back online. Otherwise the moment an account recovers,
+      // this resets to null and the event becomes permanently invisible to
+      // the Today/Week/Month/Year "Recovered" buckets, since those require
+      // lastLogout to still be set even after status flips back to online.
+      let lastLogout = prev ? prev.lastLogout : null;
+      let logSource  = prev ? prev.logSource  : null;
+
       if (!isOnline) {
         const parsed = parseRouterOsTime(secret['last-logged-out']);
         // RouterOS uses the epoch (jan/01/1970) as a sentinel for "this
@@ -536,16 +544,12 @@ async function pollRouter() {
         // real timestamp.
         if (parsed && parsed.getFullYear() <= 1971) {
           if (justWentOffline) { lastLogout = now.toISOString(); logSource = 'poll'; }
-          else if (prev) { lastLogout = prev.lastLogout; logSource = prev.logSource; }
         } else if (parsed) {
           lastLogout = parsed.toISOString();
           logSource = 'secret';
         } else if (justWentOffline) {
           lastLogout = now.toISOString();
           logSource = 'poll';
-        } else if (prev) {
-          lastLogout = prev.lastLogout;
-          logSource = prev.logSource;
         }
       }
 
@@ -995,7 +999,7 @@ tbody td { padding:9px 12px; color:#9aa3bc; vertical-align:middle; }
               </div>
               <div class="lc-stat">
                 <div class="lc-stat-n red" id="cn-live-off">—</div>
-                <div class="lc-stat-l">🔴 Offline (This Month)</div>
+                <div class="lc-stat-l">🔴 Offline</div>
               </div>
             </div>
           </div>
@@ -1282,15 +1286,13 @@ function render(data) {
 function updateCards() {
   const total   = allAccounts.length;
   const online  = allAccounts.filter(a=>a.status==='online').length;
-  const offlineThisMonth = allAccounts.filter(a =>
-    a.status==='offline' && a.lastLogout && inPeriod(a.lastLogout, 'month')
-  ).length;
+  const offline = allAccounts.filter(a=>a.status==='offline').length;
 
-  // Live card
+  // Live card — true current counts, so the donut always adds up to total
   document.getElementById('dn-live').textContent    = total;
   document.getElementById('cn-live-on').textContent  = online;
-  document.getElementById('cn-live-off').textContent = offlineThisMonth;
-  drawDonut('svg-live', online, offlineThisMonth, total);
+  document.getElementById('cn-live-off').textContent = offline;
+  drawDonut('svg-live', online, offline, total);
 
   // Period cards
   ['today','week','month','year'].forEach(p => {
