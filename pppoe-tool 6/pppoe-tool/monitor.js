@@ -248,6 +248,7 @@ function parseTerse(output) {
 // still works fully via SSH; these fields are just left blank.
 
 let billingCookie = null;
+let loggedCoordColStatus = false;
 
 async function billingLogin() {
   const loginUrl = `${BILLING_BASE_URL}/actions/login_check.php`;
@@ -326,12 +327,14 @@ async function billingFetchCsv() {
   return text;
 }
 
-// TaokiNinam customer profiles have optional latitude/longitude fields
-// (most customers don't have them filled in yet). The exact CSV header
-// name isn't confirmed, so try the common variants a billing export like
-// this tends to use and take whichever one actually appears in the header
-// row. Set BILLING_DEBUG=true to log the real header row if none of these
-// match, then add the real name here.
+// TaokiNinam customer profiles have an optional map pin (set from the
+// Map Coverage page), stored in the CSV export as a single combined
+// "COORDINATES" column formatted as "lat,long" (e.g.
+// "10.247864010203564,123.79669994115831") — confirmed directly against
+// the export. Most customers don't have this set yet (empty string).
+// Kept LAT_COL_CANDIDATES/LNG_COL_CANDIDATES as a fallback in case the
+// export format ever changes to separate columns.
+const COORD_COL_CANDIDATES = ['COORDINATES', 'COORDINATE', 'GPS', 'LOCATION', 'PIN'];
 const LAT_COL_CANDIDATES = ['LATITUDE', 'LAT', 'GEOLAT', 'GEO_LAT', 'Y_COORD', 'YCOORD'];
 const LNG_COL_CANDIDATES = ['LONGITUDE', 'LONG', 'LNG', 'LON', 'GEOLONG', 'GEO_LONG', 'X_COORD', 'XCOORD'];
 
@@ -349,6 +352,18 @@ function parseCoord(raw) {
   if (!s) return null;
   const n = parseFloat(s);
   return Number.isFinite(n) ? n : null;
+}
+
+// Parses a combined "COORDINATES" cell like "10.247864,123.796699" into
+// { lat, lng }, or nulls if empty/malformed (most customers: empty).
+function parseCombinedCoord(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return { lat: null, lng: null };
+  const parts = s.split(',').map(p => p.trim());
+  if (parts.length !== 2) return { lat: null, lng: null };
+  const lat = parseCoord(parts[0]);
+  const lng = parseCoord(parts[1]);
+  return (lat !== null && lng !== null) ? { lat, lng } : { lat: null, lng: null };
 }
 
 // Minimal RFC4180 CSV parser — handles quoted fields, escaped quotes ("")
@@ -497,12 +512,24 @@ async function fetchBillingEnrichment() {
     const iUsername = col('USERNAME');
     const iNap      = col('NAP');
     const iPort     = col('PORT');
+    const iCoord    = findCol(header, COORD_COL_CANDIDATES);
     const iLat      = findCol(header, LAT_COL_CANDIDATES);
     const iLng      = findCol(header, LNG_COL_CANDIDATES);
 
     if (iUsername === -1) throw new Error('billing export missing USERNAME column');
-    if (BILLING_DEBUG && (iLat === -1 || iLng === -1)) {
-      console.log(`[billing debug] latitude/longitude column not recognized (lat found: ${iLat !== -1}, lng found: ${iLng !== -1}). CSV headers: ${header.join(', ')}`);
+
+    // Log which column we're using for map pins once per process run —
+    // unconditionally (not gated behind BILLING_DEBUG), since this is new
+    // and worth confirming without needing an .env change + restart.
+    if (!loggedCoordColStatus) {
+      loggedCoordColStatus = true;
+      if (iCoord !== -1) {
+        console.log(`[billing] Customer map using CSV column "${header[iCoord]}" (col ${iCoord}, "lat,long" combined format).`);
+      } else if (iLat !== -1 && iLng !== -1) {
+        console.log(`[billing] Customer map using separate CSV columns "${header[iLat]}" (lat) and "${header[iLng]}" (lng).`);
+      } else {
+        console.warn(`[billing] Could not find a coordinates column in the TaokiNinam CSV export. Actual CSV headers: ${header.join(', ')} — tell Claude these exact header names so the map tab can be pointed at the right column.`);
+      }
     }
 
     const map = new Map();
@@ -515,11 +542,23 @@ async function fetchBillingEnrichment() {
       const lname = (row[iLname] || '').trim();
       const nap   = (row[iNap]   || '').trim();
       const port  = (row[iPort]  || '').trim();
-      // Only kept when both lat and lng are present and parse as real
-      // numbers — most customers don't have these set yet, and a pin
-      // should only ever appear for the ones that do.
-      const lat = iLat !== -1 ? parseCoord(row[iLat]) : null;
-      const lng = iLng !== -1 ? parseCoord(row[iLng]) : null;
+
+      // Most customers don't have a pin set yet — a pin should only ever
+      // appear on the map for the ones that do. Preferred source: the
+      // combined "COORDINATES" column ("lat,long" in one cell, as
+      // TaokiNinam's Map Coverage feature actually stores it). Falls back
+      // to separate lat/lng columns if the export format ever changes.
+      let lat = null, lng = null;
+      if (iCoord !== -1) {
+        const combined = parseCombinedCoord(row[iCoord]);
+        lat = combined.lat;
+        lng = combined.lng;
+      }
+      if ((lat === null || lng === null) && iLat !== -1 && iLng !== -1) {
+        const la = parseCoord(row[iLat]);
+        const lo = parseCoord(row[iLng]);
+        if (la !== null && lo !== null) { lat = la; lng = lo; }
+      }
 
       map.set(username.toLowerCase(), {
         accountNo:    (row[iAccount] || '').trim(),
@@ -527,8 +566,7 @@ async function fetchBillingEnrichment() {
         contactNo:    (row[iPhone] || '').trim(),
         area:         (row[iArea] || '').trim(),
         napBox:       [nap, port].filter(Boolean).join(' / '),
-        lat: (lat !== null && lng !== null) ? lat : null,
-        lng: (lat !== null && lng !== null) ? lng : null,
+        lat, lng,
       });
     }
 
@@ -1361,7 +1399,7 @@ function render(data) {
 // ---- Customer Map (Leaflet + OpenStreetMap — no API key needed) ----
 function ensureMap() {
   if (map) return;
-  map = L.map('map', { attributionControl: true }).setView([12.8797, 121.7740], 6); // fallback center: Philippines
+  map = L.map('map', { attributionControl: true }).setView([10.2433, 123.7890], 13); // Minglanilla, Cebu, Philippines
   L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
     maxZoom: 19,
     attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
