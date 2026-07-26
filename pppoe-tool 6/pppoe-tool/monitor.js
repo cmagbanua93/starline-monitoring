@@ -52,10 +52,15 @@
  *   MONITOR_POLL_INTERVAL=30              seconds between polls
  *   MONITOR_ALERT_THRESHOLD=5             how many offline (since today) triggers the alarm
  *   BILLING_DEBUG=true                    (optional) verbose TaokiNinam login/fetch logging
+ *   MONITOR_FLAP_THRESHOLD=5               (optional) disconnects within the flap window to flag an account as "flapping"
+ *   MONITOR_FLAP_WINDOW_DAYS=7             (optional) rolling window (days) the flap threshold is measured over
+ *   MONITOR_FLAP_LOG_PATH=./flap-log.jsonl (optional) where flap events are persisted across restarts
  */
 
 require('dotenv').config();
 const http = require('http');
+const fs = require('fs');
+const path = require('path');
 const { NodeSSH } = require('node-ssh');
 
 // ---------- Config ----------
@@ -118,6 +123,97 @@ if (!BILLING_ENABLED) {
   console.warn('TAOKININAM_USERNAME / TAOKININAM_PASSWORD not set — running without billing enrichment (customer name/account/contact/area/NAP box will be blank).');
 }
 
+// ---- Flapping detection (accounts disconnecting repeatedly, not just once) ----
+// A clean single outage and a line that's dropped 15 times today look
+// identical in a plain online/offline snapshot — this tracks *how often*
+// each account has gone offline, so a bad ONU/cable shows up distinctly
+// from a real one-off outage. Events are persisted to a small JSONL log
+// so the history survives a restart (e.g. pm2/reboot on the Pi), unlike
+// the rest of `state`, which is rebuilt from scratch on every process start.
+const FLAP_THRESHOLD    = parseInt(process.env.MONITOR_FLAP_THRESHOLD || '5');
+const FLAP_WINDOW_DAYS  = parseInt(process.env.MONITOR_FLAP_WINDOW_DAYS || '7');
+const FLAP_WINDOW_MS    = FLAP_WINDOW_DAYS * 24 * 60 * 60 * 1000;
+const FLAP_RETENTION_MS = 30 * 24 * 60 * 60 * 1000; // don't keep events older than this, on disk or in memory
+const FLAP_LOG_PATH     = process.env.MONITOR_FLAP_LOG_PATH || path.join(__dirname, 'flap-log.jsonl');
+
+// username (lowercase) -> array of disconnect-event timestamps (ms), oldest first
+const flapEvents = new Map();
+
+function loadFlapHistory() {
+  try {
+    if (!fs.existsSync(FLAP_LOG_PATH)) return;
+    const cutoff = Date.now() - FLAP_RETENTION_MS;
+    const lines = fs.readFileSync(FLAP_LOG_PATH, 'utf8').split('\n').filter(Boolean);
+    for (const line of lines) {
+      let rec;
+      try { rec = JSON.parse(line); } catch { continue; }
+      if (!rec || !rec.username || !rec.ts || rec.ts < cutoff) continue;
+      const key = String(rec.username).toLowerCase();
+      if (!flapEvents.has(key)) flapEvents.set(key, []);
+      flapEvents.get(key).push(rec.ts);
+    }
+    for (const arr of flapEvents.values()) arr.sort((a, b) => a - b);
+    // Compact the file to drop anything past FLAP_RETENTION_MS so it
+    // doesn't grow forever across years of uptime.
+    rewriteFlapLog();
+    const totalEvents = [...flapEvents.values()].reduce((n, a) => n + a.length, 0);
+    console.log(`[flap] loaded ${totalEvents} disconnect event(s) for ${flapEvents.size} account(s) from ${FLAP_LOG_PATH}`);
+  } catch (err) {
+    console.warn(`[flap] could not load flap history from ${FLAP_LOG_PATH}:`, err.message);
+  }
+}
+
+function rewriteFlapLog() {
+  try {
+    const lines = [];
+    for (const [username, events] of flapEvents) {
+      for (const ts of events) lines.push(JSON.stringify({ username, ts }));
+    }
+    fs.writeFileSync(FLAP_LOG_PATH, lines.length ? lines.join('\n') + '\n' : '');
+  } catch (err) {
+    console.warn(`[flap] could not rewrite flap log at ${FLAP_LOG_PATH}:`, err.message);
+  }
+}
+
+// Records a single disconnect event (call this exactly when an account is
+// observed transitioning online -> offline, i.e. the existing
+// `justWentOffline` check in pollRouter()). Never throws — a disk hiccup
+// here shouldn't take monitoring down.
+function recordFlapEvent(username) {
+  const key = String(username).toLowerCase();
+  const now = Date.now();
+  if (!flapEvents.has(key)) flapEvents.set(key, []);
+  const arr = flapEvents.get(key);
+  arr.push(now);
+  const cutoff = now - FLAP_RETENTION_MS;
+  while (arr.length && arr[0] < cutoff) arr.shift();
+  try {
+    fs.appendFileSync(FLAP_LOG_PATH, JSON.stringify({ username: key, ts: now }) + '\n');
+  } catch (err) {
+    console.warn(`[flap] could not append to flap log at ${FLAP_LOG_PATH}:`, err.message);
+  }
+}
+
+// Returns { count7d, countToday, isFlapping } for a username. "7d" actually
+// means FLAP_WINDOW_DAYS (default 7) — name kept short for the property.
+function getFlapCounts(username) {
+  const key = String(username).toLowerCase();
+  const events = flapEvents.get(key) || [];
+  const now = Date.now();
+  const windowCutoff = now - FLAP_WINDOW_MS;
+  const todayStart = new Date();
+  todayStart.setHours(0, 0, 0, 0);
+  const todayCutoff = todayStart.getTime();
+  let count7d = 0, countToday = 0;
+  for (const ts of events) {
+    if (ts >= windowCutoff) count7d++;
+    if (ts >= todayCutoff) countToday++;
+  }
+  return { count7d, countToday, isFlapping: count7d >= FLAP_THRESHOLD };
+}
+
+loadFlapHistory();
+
 // ---------- State ----------
 
 let state = {
@@ -131,6 +227,9 @@ let state = {
   routerHost: `${SSH_HOST}:${SSH_PORT} (SSH)`,
   pollIntervalSec: Math.round(POLL_INTERVAL_MS / 1000),
   alertThreshold: ALERT_THRESHOLD,
+  flapThreshold: FLAP_THRESHOLD,
+  flapWindowDays: FLAP_WINDOW_DAYS,
+  flappingCount: 0,
   billingEnabled: BILLING_ENABLED,
   billingLastSync: null,
   billingError: null,
@@ -628,6 +727,12 @@ async function pollRouter() {
         }
       }
 
+      // Flapping: record exactly one event per online->offline transition
+      // (not every poll while it stays offline), so an account that's been
+      // down all day for one reason counts as 1, not dozens.
+      if (justWentOffline) recordFlapEvent(username);
+      const flap = getFlapCounts(username);
+
       const enrich = enrichment.map.get(username.toLowerCase()) || {};
 
       updated.push({
@@ -647,6 +752,9 @@ async function pollRouter() {
         napBox: enrich.napBox || '',
         lat: typeof enrich.lat === 'number' ? enrich.lat : null,
         lng: typeof enrich.lng === 'number' ? enrich.lng : null,
+        flapCount7d: flap.count7d,
+        flapCountToday: flap.countToday,
+        isFlapping: flap.isFlapping,
       });
     }
 
@@ -670,12 +778,14 @@ async function pollRouter() {
       new Date(a.lastLogout).toDateString() === todayStr
     ).length;
     const alertActive = todayDownCount >= ALERT_THRESHOLD;
+    const flappingCount = updated.filter(a => a.isFlapping).length;
 
     state = {
       ...state,
       accounts: updated,
       downCount,
       todayDownCount,
+      flappingCount,
       totalCount: updated.length,
       alertActive,
       alertSince: alertActive ? (state.alertSince || now.toISOString()) : null,
@@ -965,6 +1075,8 @@ tbody td { padding:9px 12px; color:#9aa3bc; vertical-align:middle; }
 .badge.offline { background:#7f1d1d33; color:#f87171; border:1px solid #991b1b; }
 .badge.online::before  { background:var(--green); box-shadow:0 0 4px var(--green); }
 .badge.offline::before { background:var(--red); }
+.badge.flapping { background:#78350f33; color:var(--amber); border:1px solid #78350f; }
+.badge.flapping::before { background:var(--amber); box-shadow:0 0 4px var(--amber); }
 
 .src-tag { display:inline-block; font-size:9px; padding:1px 5px; border-radius:3px; margin-left:5px; font-weight:600; vertical-align:middle; }
 .src-tag.secret { background:#1e3a5f; color:#60a5fa; border:1px solid #1e40af; }
@@ -1057,6 +1169,7 @@ tbody td { padding:9px 12px; color:#9aa3bc; vertical-align:middle; }
         <span>Interval: <strong id="tb-interval">—</strong>s</span>
         <span>Alert at: <strong id="tb-thresh">—</strong>+ offline</span>
         <span>Billing: <strong id="tb-billing">—</strong></span>
+        <span>🔁 Flapping: <strong id="tb-flapping">—</strong></span>
       </div>
     </div>
 
@@ -1187,6 +1300,7 @@ tbody td { padding:9px 12px; color:#9aa3bc; vertical-align:middle; }
           <button class="tb-btn active" id="btn-all"     onclick="setFilter('all')">All</button>
           <button class="tb-btn"        id="btn-online"  onclick="setFilter('online')">🟢 Online</button>
           <button class="tb-btn"        id="btn-offline" onclick="setFilter('offline')">🔴 Offline</button>
+          <button class="tb-btn"        id="btn-flapping" onclick="setFilter('flapping')">🔁 Flapping</button>
         </span>
         <div class="tb-divider"></div>
         <label class="tb-label">Sort:</label>
@@ -1198,6 +1312,7 @@ tbody td { padding:9px 12px; color:#9aa3bc; vertical-align:middle; }
           <option value="username-za">Username Z–A</option>
           <option value="customer-az">Customer A–Z</option>
           <option value="lastseen-desc">Last Seen (newest)</option>
+          <option value="flap-desc">Most flapping first</option>
         </select>
       </div>
 
@@ -1218,6 +1333,7 @@ tbody td { padding:9px 12px; color:#9aa3bc; vertical-align:middle; }
               <th>Comment</th>
               <th onclick="setSort('lastseen-desc')">Last Seen <span class="arr" id="arr-lastseen"></span></th>
               <th onclick="setSort('offline-recent')">Logged Out At <span class="arr" id="arr-logout"></span></th>
+              <th onclick="setSort('flap-desc')">Flaps <span class="arr" id="arr-flap"></span></th>
             </tr>
           </thead>
           <tbody id="tbody"></tbody>
@@ -1383,6 +1499,8 @@ function render(data) {
   document.getElementById('tb-billing').textContent  = !data.billingEnabled
     ? 'not configured'
     : (data.billingError ? '⚠ ' + data.billingError : (data.billingCustomerCount + ' accounts synced ' + fmt(data.billingLastSync)));
+  document.getElementById('tb-flapping').textContent = (data.flappingCount || 0) + ' account' + (data.flappingCount === 1 ? '' : 's')
+    + ' (' + (data.flapThreshold || 5) + '+ drops / ' + (data.flapWindowDays || 7) + 'd)';
 
   clearInterval(cdTimer);
   let rem = data.pollIntervalSec || 30;
@@ -1433,6 +1551,7 @@ function updateMapMarkers() {
       <div class="mtt-row">Contact #: \${esc(a.contactNo) || '—'}</div>
       <div class="mtt-row">Area: \${esc(a.area) || '—'}</div>
       <div class="mtt-row">NAP Box: \${esc(a.napBox) || '—'}</div>
+      \${a.flapCount7d ? \`<div class="mtt-row" style="color:\${a.isFlapping ? '#d97706' : 'inherit'}">\${a.isFlapping ? '🔁 ' : ''}Flaps: \${a.flapCount7d}</div>\` : ''}
     </div>\`;
     marker.bindTooltip(tooltipHtml, { direction: 'top', sticky: true, opacity: 0.98, className: 'map-tooltip-wrap' });
     marker.addTo(mapMarkerLayer);
@@ -1517,7 +1636,7 @@ function setView(v) {
 // ---- Filter ----
 function setFilter(f) {
   currentFilter = f;
-  ['all','online','offline'].forEach(id => document.getElementById('btn-'+id).classList.toggle('active', id===f));
+  ['all','online','offline','flapping'].forEach(id => document.getElementById('btn-'+id).classList.toggle('active', id===f));
   applyDisplay();
 }
 
@@ -1532,9 +1651,10 @@ const ARROW_CFG = {
   'username-za':   {col:'username',dir:'▼'},
   'lastseen-desc': {col:'lastseen',dir:'▼'},
   'customer-az':   {col:'customer',dir:'▲'},
+  'flap-desc':     {col:'flap',    dir:'▼'},
 };
 function updateArrows(v) {
-  ['status','username','customer','lastseen','logout'].forEach(c => {
+  ['status','username','customer','lastseen','logout','flap'].forEach(c => {
     const el=document.getElementById('arr-'+c); el.textContent=''; el.parentElement.classList.remove('sorted');
   });
   const cfg=ARROW_CFG[v];
@@ -1552,6 +1672,7 @@ function sortAccounts(list, v) {
     case 'username-za':    return c.sort((a,b)=> b.username.localeCompare(a.username));
     case 'lastseen-desc':  return c.sort((a,b)=> ts(b.lastSeen)-ts(a.lastSeen));
     case 'customer-az':    return c.sort((a,b)=> (a.customerName||'').localeCompare(b.customerName||''));
+    case 'flap-desc':      return c.sort((a,b)=> (b.flapCount7d||0)-(a.flapCount7d||0));
     default: return c;
   }
 }
@@ -1577,7 +1698,9 @@ function applyDisplay() {
 
   if (selectedCard === 'live' || currentView === 'table') {
     list = allAccounts.filter(a => {
-      const mf = currentFilter==='all' || a.status===currentFilter;
+      const mf = currentFilter==='all' ? true
+        : currentFilter==='flapping' ? a.isFlapping
+        : a.status===currentFilter;
       return mf && matchesQuery(a);
     });
     list = sortAccounts(list, sv);
@@ -1617,6 +1740,9 @@ function applyDisplay() {
       <td style="color:var(--dim);font-size:12px">\${esc(a.comment)||'—'}</td>
       <td style="color:var(--dim);font-size:12px">\${fmt(a.lastSeen)}</td>
       <td style="font-size:12px">\${src}</td>
+      <td style="font-size:12px">\${a.flapCount7d
+        ? (a.isFlapping ? \`<span class="badge flapping">🔁 \${a.flapCount7d}</span>\` : a.flapCount7d)
+        : '—'}</td>
     </tr>\`;
   }).join('');
 }
