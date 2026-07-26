@@ -326,6 +326,31 @@ async function billingFetchCsv() {
   return text;
 }
 
+// TaokiNinam customer profiles have optional latitude/longitude fields
+// (most customers don't have them filled in yet). The exact CSV header
+// name isn't confirmed, so try the common variants a billing export like
+// this tends to use and take whichever one actually appears in the header
+// row. Set BILLING_DEBUG=true to log the real header row if none of these
+// match, then add the real name here.
+const LAT_COL_CANDIDATES = ['LATITUDE', 'LAT', 'GEOLAT', 'GEO_LAT', 'Y_COORD', 'YCOORD'];
+const LNG_COL_CANDIDATES = ['LONGITUDE', 'LONG', 'LNG', 'LON', 'GEOLONG', 'GEO_LONG', 'X_COORD', 'XCOORD'];
+
+function findCol(header, candidates) {
+  for (const name of candidates) {
+    const i = header.indexOf(name);
+    if (i !== -1) return i;
+  }
+  return -1;
+}
+
+function parseCoord(raw) {
+  if (raw === undefined || raw === null) return null;
+  const s = String(raw).trim();
+  if (!s) return null;
+  const n = parseFloat(s);
+  return Number.isFinite(n) ? n : null;
+}
+
 // Minimal RFC4180 CSV parser — handles quoted fields, escaped quotes ("")
 // and embedded newlines inside quoted fields (TaokiNinam's export uses these).
 function parseCsv(text) {
@@ -472,8 +497,13 @@ async function fetchBillingEnrichment() {
     const iUsername = col('USERNAME');
     const iNap      = col('NAP');
     const iPort     = col('PORT');
+    const iLat      = findCol(header, LAT_COL_CANDIDATES);
+    const iLng      = findCol(header, LNG_COL_CANDIDATES);
 
     if (iUsername === -1) throw new Error('billing export missing USERNAME column');
+    if (BILLING_DEBUG && (iLat === -1 || iLng === -1)) {
+      console.log(`[billing debug] latitude/longitude column not recognized (lat found: ${iLat !== -1}, lng found: ${iLng !== -1}). CSV headers: ${header.join(', ')}`);
+    }
 
     const map = new Map();
     for (let r = 1; r < rows.length; r++) {
@@ -485,6 +515,11 @@ async function fetchBillingEnrichment() {
       const lname = (row[iLname] || '').trim();
       const nap   = (row[iNap]   || '').trim();
       const port  = (row[iPort]  || '').trim();
+      // Only kept when both lat and lng are present and parse as real
+      // numbers — most customers don't have these set yet, and a pin
+      // should only ever appear for the ones that do.
+      const lat = iLat !== -1 ? parseCoord(row[iLat]) : null;
+      const lng = iLng !== -1 ? parseCoord(row[iLng]) : null;
 
       map.set(username.toLowerCase(), {
         accountNo:    (row[iAccount] || '').trim(),
@@ -492,6 +527,8 @@ async function fetchBillingEnrichment() {
         contactNo:    (row[iPhone] || '').trim(),
         area:         (row[iArea] || '').trim(),
         napBox:       [nap, port].filter(Boolean).join(' / '),
+        lat: (lat !== null && lng !== null) ? lat : null,
+        lng: (lat !== null && lng !== null) ? lng : null,
       });
     }
 
@@ -570,6 +607,8 @@ async function pollRouter() {
         contactNo: enrich.contactNo || '',
         area: enrich.area || '',
         napBox: enrich.napBox || '',
+        lat: typeof enrich.lat === 'number' ? enrich.lat : null,
+        lng: typeof enrich.lng === 'number' ? enrich.lng : null,
       });
     }
 
@@ -634,6 +673,7 @@ function dashboardHtml() {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>StarLine Internet Customer Uptime Monitor</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
 <style>
 :root {
   --bg:       #0e1018;
@@ -899,6 +939,20 @@ tbody td { padding:9px 12px; color:#9aa3bc; vertical-align:middle; }
 #error-bar.active { display:block; }
 #no-results { text-align:center; color:var(--dim); padding:36px; font-size:13px; }
 
+/* ---- Customer Map ---- */
+#view-map { display:none; flex-direction:column; gap:12px; flex:1; }
+.map-legend { display:flex; align-items:center; gap:18px; font-size:12px; color:#9aa8c0; }
+.map-legend .dot { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:6px; vertical-align:middle; }
+.map-legend .dot.green { background:var(--green); box-shadow:0 0 5px var(--green)44; }
+.map-legend .dot.red   { background:var(--red); }
+#map-nocoord-note { color:var(--dim); margin-left:auto; }
+#map { height:70vh; min-height:420px; border-radius:12px; overflow:hidden; border:1px solid var(--border); background:#181b28; }
+.map-tt { font-family:'Segoe UI', system-ui, sans-serif; min-width:190px; color:#1a1a2e; }
+.map-tt .mtt-name { font-weight:700; margin-bottom:5px; font-size:13px; }
+.map-tt .mtt-row  { font-size:12px; line-height:1.55; }
+.map-tt .mtt-status { font-weight:700; }
+.leaflet-tooltip-top.map-tooltip-wrap::before { border-top-color: #fff; }
+
 /* ---- Mobile ---- */
 @media (max-width: 900px) {
   .overview-panel { grid-template-columns: 1fr; }
@@ -946,6 +1000,9 @@ tbody td { padding:9px 12px; color:#9aa3bc; vertical-align:middle; }
     </div>
     <div class="snav" id="snav-table" onclick="setView('table')">
       ☰ <span class="stip">Account List</span>
+    </div>
+    <div class="snav" id="snav-map" onclick="setView('map')">
+      🗺 <span class="stip">Customer Map</span>
     </div>
   </nav>
 
@@ -1071,6 +1128,19 @@ tbody td { padding:9px 12px; color:#9aa3bc; vertical-align:middle; }
       </div>
       <!-- /Dashboard view -->
 
+      <!-- Customer Map view -->
+      <div id="view-map">
+        <div class="section-header"><span class="section-title">Customer Map</span><div class="section-line"></div></div>
+        <div class="map-legend">
+          <span><span class="dot green"></span>Online</span>
+          <span><span class="dot red"></span>Offline</span>
+          <span id="map-nocoord-note"></span>
+        </div>
+        <div id="map"></div>
+      </div>
+      <!-- /Customer Map view -->
+
+      <div id="table-section">
       <!-- Toolbar (always shown) -->
       <div class="toolbar">
         <input class="tb-input" id="search" type="text" placeholder="Search username, customer, account #, area, NAP…" oninput="applyDisplay()">
@@ -1116,11 +1186,13 @@ tbody td { padding:9px 12px; color:#9aa3bc; vertical-align:middle; }
         </table>
         <div id="no-results"></div>
       </div>
+      </div><!-- /table-section -->
 
     </div><!-- /content -->
   </div><!-- /main -->
 </div><!-- /app -->
 
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script>
 // ---- State ----
 let allAccounts   = [];
@@ -1132,6 +1204,9 @@ let alarmCtx      = null;
 let alarmTimer    = null;
 let wasAlert      = false;
 let cdTimer       = null;
+let map            = null;
+let mapMarkerLayer = null;
+let mapFitDone      = false;
 
 // ---- SSE ----
 const evtSource = new EventSource('/events');
@@ -1280,6 +1355,65 @@ function render(data) {
   updateCards();
   applyDisplay();
   renderIsps(data.isps);
+  if (map) updateMapMarkers();
+}
+
+// ---- Customer Map (Leaflet + OpenStreetMap — no API key needed) ----
+function ensureMap() {
+  if (map) return;
+  map = L.map('map', { attributionControl: true }).setView([12.8797, 121.7740], 6); // fallback center: Philippines
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19,
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+  }).addTo(map);
+  mapMarkerLayer = L.layerGroup().addTo(map);
+}
+
+function updateMapMarkers() {
+  if (!mapMarkerLayer) return;
+  mapMarkerLayer.clearLayers();
+
+  const withCoords = allAccounts.filter(a =>
+    typeof a.lat === 'number' && typeof a.lng === 'number' &&
+    isFinite(a.lat) && isFinite(a.lng)
+  );
+
+  withCoords.forEach(a => {
+    const online = a.status === 'online';
+    const marker = L.circleMarker([a.lat, a.lng], {
+      radius: 8,
+      color: '#fff',
+      weight: 2,
+      fillColor: online ? '#8dc63f' : '#e84040',
+      fillOpacity: 0.9,
+    });
+    const tooltipHtml = \`<div class="map-tt">
+      <div class="mtt-name">\${esc(a.customerName) || esc(a.username)}</div>
+      <div class="mtt-row">Status: <span class="mtt-status" style="color:\${online ? '#16a34a' : '#dc2626'}">\${esc(a.status)}</span></div>
+      <div class="mtt-row">Username: \${esc(a.username)}</div>
+      <div class="mtt-row">Account #: \${esc(a.accountNo) || '—'}</div>
+      <div class="mtt-row">Contact #: \${esc(a.contactNo) || '—'}</div>
+      <div class="mtt-row">Area: \${esc(a.area) || '—'}</div>
+      <div class="mtt-row">NAP Box: \${esc(a.napBox) || '—'}</div>
+    </div>\`;
+    marker.bindTooltip(tooltipHtml, { direction: 'top', sticky: true, opacity: 0.98, className: 'map-tooltip-wrap' });
+    marker.addTo(mapMarkerLayer);
+  });
+
+  const note = document.getElementById('map-nocoord-note');
+  if (note) {
+    note.textContent = allAccounts.length
+      ? \`\${withCoords.length} of \${allAccounts.length} customers have map coordinates set\`
+      : '';
+  }
+
+  // Auto-fit the view once, the first time we have pins — after that, leave
+  // the user's own pan/zoom alone on subsequent SSE refreshes.
+  if (withCoords.length && !mapFitDone) {
+    const bounds = L.latLngBounds(withCoords.map(a => [a.lat, a.lng]));
+    map.fitBounds(bounds, { padding: [30, 30], maxZoom: 15 });
+    mapFitDone = true;
+  }
 }
 
 // ---- Update donut cards ----
@@ -1329,9 +1463,17 @@ function selectCard(id) {
 function setView(v) {
   currentView = v;
   document.getElementById('view-dashboard').style.display = v==='dashboard' ? '' : 'none';
+  document.getElementById('view-map').style.display       = v==='map' ? 'flex' : 'none';
+  document.getElementById('table-section').style.display  = v==='map' ? 'none' : '';
   document.getElementById('snav-dash').classList.toggle('active',  v==='dashboard');
   document.getElementById('snav-table').classList.toggle('active', v==='table');
+  document.getElementById('snav-map').classList.toggle('active', v==='map');
   if (v==='table') { document.getElementById('filt-btns').style.display=''; document.getElementById('filt-div').style.display=''; }
+  if (v==='map') {
+    ensureMap();
+    // Container was just un-hidden — Leaflet needs a beat to see its real size.
+    setTimeout(() => { map.invalidateSize(); updateMapMarkers(); }, 60);
+  }
 }
 
 // ---- Filter ----
