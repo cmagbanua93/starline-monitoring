@@ -47,20 +47,15 @@
  *   MIKROTIK_SSH_PASSWORD=yourpassword                 (required)
  *   TAOKININAM_USERNAME=you@example.com   (optional) enables customer-info enrichment
  *   TAOKININAM_PASSWORD=yourpassword      (optional)
- *   TAOKININAM_BASE_URL=https://taokininam.com   (optional, this is the default)
+ *   TAOKININAM_BASE_URL=https://starline.ph   (optional, this is the default)
  *   MONITOR_PORT=3000                     (optional; PORT env var wins if set)
  *   MONITOR_POLL_INTERVAL=30              seconds between polls
  *   MONITOR_ALERT_THRESHOLD=5             how many offline (since today) triggers the alarm
  *   BILLING_DEBUG=true                    (optional) verbose TaokiNinam login/fetch logging
- *   MONITOR_FLAP_THRESHOLD=5               (optional) disconnects within the flap window to flag an account as "flapping"
- *   MONITOR_FLAP_WINDOW_DAYS=7             (optional) rolling window (days) the flap threshold is measured over
- *   MONITOR_FLAP_LOG_PATH=./flap-log.jsonl (optional) where flap events are persisted across restarts
  */
 
 require('dotenv').config();
 const http = require('http');
-const fs = require('fs');
-const path = require('path');
 const { NodeSSH } = require('node-ssh');
 
 // ---------- Config ----------
@@ -102,7 +97,7 @@ if (!SSH_HOST || !SSH_USER || !SSH_PASSWORD) {
 // ---- TaokiNinam billing system (OPTIONAL — customer-info enrichment only) ----
 // If unset, monitoring still works fully via SSH; customer name/account/
 // contact/area/NAP box just stay blank.
-const BILLING_BASE_URL = (process.env.TAOKININAM_BASE_URL || 'https://taokininam.com').replace(/\/$/, '');
+const BILLING_BASE_URL = (process.env.TAOKININAM_BASE_URL || 'https://starline.ph').replace(/\/$/, '');
 const BILLING_USERNAME = process.env.TAOKININAM_USERNAME;
 const BILLING_PASSWORD = process.env.TAOKININAM_PASSWORD;
 const BILLING_DEBUG    = String(process.env.BILLING_DEBUG || '').toLowerCase() === 'true';
@@ -123,97 +118,6 @@ if (!BILLING_ENABLED) {
   console.warn('TAOKININAM_USERNAME / TAOKININAM_PASSWORD not set — running without billing enrichment (customer name/account/contact/area/NAP box will be blank).');
 }
 
-// ---- Flapping detection (accounts disconnecting repeatedly, not just once) ----
-// A clean single outage and a line that's dropped 15 times today look
-// identical in a plain online/offline snapshot — this tracks *how often*
-// each account has gone offline, so a bad ONU/cable shows up distinctly
-// from a real one-off outage. Events are persisted to a small JSONL log
-// so the history survives a restart (e.g. pm2/reboot on the Pi), unlike
-// the rest of `state`, which is rebuilt from scratch on every process start.
-const FLAP_THRESHOLD    = parseInt(process.env.MONITOR_FLAP_THRESHOLD || '5');
-const FLAP_WINDOW_DAYS  = parseInt(process.env.MONITOR_FLAP_WINDOW_DAYS || '7');
-const FLAP_WINDOW_MS    = FLAP_WINDOW_DAYS * 24 * 60 * 60 * 1000;
-const FLAP_RETENTION_MS = 30 * 24 * 60 * 60 * 1000; // don't keep events older than this, on disk or in memory
-const FLAP_LOG_PATH     = process.env.MONITOR_FLAP_LOG_PATH || path.join(__dirname, 'flap-log.jsonl');
-
-// username (lowercase) -> array of disconnect-event timestamps (ms), oldest first
-const flapEvents = new Map();
-
-function loadFlapHistory() {
-  try {
-    if (!fs.existsSync(FLAP_LOG_PATH)) return;
-    const cutoff = Date.now() - FLAP_RETENTION_MS;
-    const lines = fs.readFileSync(FLAP_LOG_PATH, 'utf8').split('\n').filter(Boolean);
-    for (const line of lines) {
-      let rec;
-      try { rec = JSON.parse(line); } catch { continue; }
-      if (!rec || !rec.username || !rec.ts || rec.ts < cutoff) continue;
-      const key = String(rec.username).toLowerCase();
-      if (!flapEvents.has(key)) flapEvents.set(key, []);
-      flapEvents.get(key).push(rec.ts);
-    }
-    for (const arr of flapEvents.values()) arr.sort((a, b) => a - b);
-    // Compact the file to drop anything past FLAP_RETENTION_MS so it
-    // doesn't grow forever across years of uptime.
-    rewriteFlapLog();
-    const totalEvents = [...flapEvents.values()].reduce((n, a) => n + a.length, 0);
-    console.log(`[flap] loaded ${totalEvents} disconnect event(s) for ${flapEvents.size} account(s) from ${FLAP_LOG_PATH}`);
-  } catch (err) {
-    console.warn(`[flap] could not load flap history from ${FLAP_LOG_PATH}:`, err.message);
-  }
-}
-
-function rewriteFlapLog() {
-  try {
-    const lines = [];
-    for (const [username, events] of flapEvents) {
-      for (const ts of events) lines.push(JSON.stringify({ username, ts }));
-    }
-    fs.writeFileSync(FLAP_LOG_PATH, lines.length ? lines.join('\n') + '\n' : '');
-  } catch (err) {
-    console.warn(`[flap] could not rewrite flap log at ${FLAP_LOG_PATH}:`, err.message);
-  }
-}
-
-// Records a single disconnect event (call this exactly when an account is
-// observed transitioning online -> offline, i.e. the existing
-// `justWentOffline` check in pollRouter()). Never throws — a disk hiccup
-// here shouldn't take monitoring down.
-function recordFlapEvent(username) {
-  const key = String(username).toLowerCase();
-  const now = Date.now();
-  if (!flapEvents.has(key)) flapEvents.set(key, []);
-  const arr = flapEvents.get(key);
-  arr.push(now);
-  const cutoff = now - FLAP_RETENTION_MS;
-  while (arr.length && arr[0] < cutoff) arr.shift();
-  try {
-    fs.appendFileSync(FLAP_LOG_PATH, JSON.stringify({ username: key, ts: now }) + '\n');
-  } catch (err) {
-    console.warn(`[flap] could not append to flap log at ${FLAP_LOG_PATH}:`, err.message);
-  }
-}
-
-// Returns { count7d, countToday, isFlapping } for a username. "7d" actually
-// means FLAP_WINDOW_DAYS (default 7) — name kept short for the property.
-function getFlapCounts(username) {
-  const key = String(username).toLowerCase();
-  const events = flapEvents.get(key) || [];
-  const now = Date.now();
-  const windowCutoff = now - FLAP_WINDOW_MS;
-  const todayStart = new Date();
-  todayStart.setHours(0, 0, 0, 0);
-  const todayCutoff = todayStart.getTime();
-  let count7d = 0, countToday = 0;
-  for (const ts of events) {
-    if (ts >= windowCutoff) count7d++;
-    if (ts >= todayCutoff) countToday++;
-  }
-  return { count7d, countToday, isFlapping: count7d >= FLAP_THRESHOLD };
-}
-
-loadFlapHistory();
-
 // ---------- State ----------
 
 let state = {
@@ -227,9 +131,6 @@ let state = {
   routerHost: `${SSH_HOST}:${SSH_PORT} (SSH)`,
   pollIntervalSec: Math.round(POLL_INTERVAL_MS / 1000),
   alertThreshold: ALERT_THRESHOLD,
-  flapThreshold: FLAP_THRESHOLD,
-  flapWindowDays: FLAP_WINDOW_DAYS,
-  flappingCount: 0,
   billingEnabled: BILLING_ENABLED,
   billingLastSync: null,
   billingError: null,
@@ -347,7 +248,6 @@ function parseTerse(output) {
 // still works fully via SSH; these fields are just left blank.
 
 let billingCookie = null;
-let loggedCoordColStatus = false;
 
 async function billingLogin() {
   const loginUrl = `${BILLING_BASE_URL}/actions/login_check.php`;
@@ -424,45 +324,6 @@ async function billingFetchCsv() {
   }
 
   return text;
-}
-
-// TaokiNinam customer profiles have an optional map pin (set from the
-// Map Coverage page), stored in the CSV export as a single combined
-// "COORDINATES" column formatted as "lat,long" (e.g.
-// "10.247864010203564,123.79669994115831") — confirmed directly against
-// the export. Most customers don't have this set yet (empty string).
-// Kept LAT_COL_CANDIDATES/LNG_COL_CANDIDATES as a fallback in case the
-// export format ever changes to separate columns.
-const COORD_COL_CANDIDATES = ['COORDINATES', 'COORDINATE', 'GPS', 'LOCATION', 'PIN'];
-const LAT_COL_CANDIDATES = ['LATITUDE', 'LAT', 'GEOLAT', 'GEO_LAT', 'Y_COORD', 'YCOORD'];
-const LNG_COL_CANDIDATES = ['LONGITUDE', 'LONG', 'LNG', 'LON', 'GEOLONG', 'GEO_LONG', 'X_COORD', 'XCOORD'];
-
-function findCol(header, candidates) {
-  for (const name of candidates) {
-    const i = header.indexOf(name);
-    if (i !== -1) return i;
-  }
-  return -1;
-}
-
-function parseCoord(raw) {
-  if (raw === undefined || raw === null) return null;
-  const s = String(raw).trim();
-  if (!s) return null;
-  const n = parseFloat(s);
-  return Number.isFinite(n) ? n : null;
-}
-
-// Parses a combined "COORDINATES" cell like "10.247864,123.796699" into
-// { lat, lng }, or nulls if empty/malformed (most customers: empty).
-function parseCombinedCoord(raw) {
-  const s = String(raw || '').trim();
-  if (!s) return { lat: null, lng: null };
-  const parts = s.split(',').map(p => p.trim());
-  if (parts.length !== 2) return { lat: null, lng: null };
-  const lat = parseCoord(parts[0]);
-  const lng = parseCoord(parts[1]);
-  return (lat !== null && lng !== null) ? { lat, lng } : { lat: null, lng: null };
 }
 
 // Minimal RFC4180 CSV parser — handles quoted fields, escaped quotes ("")
@@ -611,25 +472,8 @@ async function fetchBillingEnrichment() {
     const iUsername = col('USERNAME');
     const iNap      = col('NAP');
     const iPort     = col('PORT');
-    const iCoord    = findCol(header, COORD_COL_CANDIDATES);
-    const iLat      = findCol(header, LAT_COL_CANDIDATES);
-    const iLng      = findCol(header, LNG_COL_CANDIDATES);
 
     if (iUsername === -1) throw new Error('billing export missing USERNAME column');
-
-    // Log which column we're using for map pins once per process run —
-    // unconditionally (not gated behind BILLING_DEBUG), since this is new
-    // and worth confirming without needing an .env change + restart.
-    if (!loggedCoordColStatus) {
-      loggedCoordColStatus = true;
-      if (iCoord !== -1) {
-        console.log(`[billing] Customer map using CSV column "${header[iCoord]}" (col ${iCoord}, "lat,long" combined format).`);
-      } else if (iLat !== -1 && iLng !== -1) {
-        console.log(`[billing] Customer map using separate CSV columns "${header[iLat]}" (lat) and "${header[iLng]}" (lng).`);
-      } else {
-        console.warn(`[billing] Could not find a coordinates column in the TaokiNinam CSV export. Actual CSV headers: ${header.join(', ')} — tell Claude these exact header names so the map tab can be pointed at the right column.`);
-      }
-    }
 
     const map = new Map();
     for (let r = 1; r < rows.length; r++) {
@@ -642,30 +486,12 @@ async function fetchBillingEnrichment() {
       const nap   = (row[iNap]   || '').trim();
       const port  = (row[iPort]  || '').trim();
 
-      // Most customers don't have a pin set yet — a pin should only ever
-      // appear on the map for the ones that do. Preferred source: the
-      // combined "COORDINATES" column ("lat,long" in one cell, as
-      // TaokiNinam's Map Coverage feature actually stores it). Falls back
-      // to separate lat/lng columns if the export format ever changes.
-      let lat = null, lng = null;
-      if (iCoord !== -1) {
-        const combined = parseCombinedCoord(row[iCoord]);
-        lat = combined.lat;
-        lng = combined.lng;
-      }
-      if ((lat === null || lng === null) && iLat !== -1 && iLng !== -1) {
-        const la = parseCoord(row[iLat]);
-        const lo = parseCoord(row[iLng]);
-        if (la !== null && lo !== null) { lat = la; lng = lo; }
-      }
-
       map.set(username.toLowerCase(), {
         accountNo:    (row[iAccount] || '').trim(),
         customerName: [fname, lname].filter(Boolean).join(' '),
         contactNo:    (row[iPhone] || '').trim(),
         area:         (row[iArea] || '').trim(),
         napBox:       [nap, port].filter(Boolean).join(' / '),
-        lat, lng,
       });
     }
 
@@ -727,12 +553,6 @@ async function pollRouter() {
         }
       }
 
-      // Flapping: record exactly one event per online->offline transition
-      // (not every poll while it stays offline), so an account that's been
-      // down all day for one reason counts as 1, not dozens.
-      if (justWentOffline) recordFlapEvent(username);
-      const flap = getFlapCounts(username);
-
       const enrich = enrichment.map.get(username.toLowerCase()) || {};
 
       updated.push({
@@ -750,11 +570,6 @@ async function pollRouter() {
         contactNo: enrich.contactNo || '',
         area: enrich.area || '',
         napBox: enrich.napBox || '',
-        lat: typeof enrich.lat === 'number' ? enrich.lat : null,
-        lng: typeof enrich.lng === 'number' ? enrich.lng : null,
-        flapCount7d: flap.count7d,
-        flapCountToday: flap.countToday,
-        isFlapping: flap.isFlapping,
       });
     }
 
@@ -778,14 +593,12 @@ async function pollRouter() {
       new Date(a.lastLogout).toDateString() === todayStr
     ).length;
     const alertActive = todayDownCount >= ALERT_THRESHOLD;
-    const flappingCount = updated.filter(a => a.isFlapping).length;
 
     state = {
       ...state,
       accounts: updated,
       downCount,
       todayDownCount,
-      flappingCount,
       totalCount: updated.length,
       alertActive,
       alertSince: alertActive ? (state.alertSince || now.toISOString()) : null,
@@ -821,7 +634,6 @@ function dashboardHtml() {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>StarLine Internet Customer Uptime Monitor</title>
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
 <style>
 :root {
   --bg:       #0e1018;
@@ -1075,8 +887,6 @@ tbody td { padding:9px 12px; color:#9aa3bc; vertical-align:middle; }
 .badge.offline { background:#7f1d1d33; color:#f87171; border:1px solid #991b1b; }
 .badge.online::before  { background:var(--green); box-shadow:0 0 4px var(--green); }
 .badge.offline::before { background:var(--red); }
-.badge.flapping { background:#78350f33; color:var(--amber); border:1px solid #78350f; }
-.badge.flapping::before { background:var(--amber); box-shadow:0 0 4px var(--amber); }
 
 .src-tag { display:inline-block; font-size:9px; padding:1px 5px; border-radius:3px; margin-left:5px; font-weight:600; vertical-align:middle; }
 .src-tag.secret { background:#1e3a5f; color:#60a5fa; border:1px solid #1e40af; }
@@ -1088,20 +898,6 @@ tbody td { padding:9px 12px; color:#9aa3bc; vertical-align:middle; }
 #error-bar { display:none; background:#7f1d1d; color:#fca5a5; padding:9px 24px; font-size:12px; }
 #error-bar.active { display:block; }
 #no-results { text-align:center; color:var(--dim); padding:36px; font-size:13px; }
-
-/* ---- Customer Map ---- */
-#view-map { display:none; flex-direction:column; gap:12px; flex:1; }
-.map-legend { display:flex; align-items:center; gap:18px; font-size:12px; color:#9aa8c0; }
-.map-legend .dot { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:6px; vertical-align:middle; }
-.map-legend .dot.green { background:var(--green); box-shadow:0 0 5px var(--green)44; }
-.map-legend .dot.red   { background:var(--red); }
-#map-nocoord-note { color:var(--dim); margin-left:auto; }
-#map { height:70vh; min-height:420px; border-radius:12px; overflow:hidden; border:1px solid var(--border); background:#181b28; }
-.map-tt { font-family:'Segoe UI', system-ui, sans-serif; min-width:190px; color:#1a1a2e; }
-.map-tt .mtt-name { font-weight:700; margin-bottom:5px; font-size:13px; }
-.map-tt .mtt-row  { font-size:12px; line-height:1.55; }
-.map-tt .mtt-status { font-weight:700; }
-.leaflet-tooltip-top.map-tooltip-wrap::before { border-top-color: #fff; }
 
 /* ---- Mobile ---- */
 @media (max-width: 900px) {
@@ -1151,9 +947,6 @@ tbody td { padding:9px 12px; color:#9aa3bc; vertical-align:middle; }
     <div class="snav" id="snav-table" onclick="setView('table')">
       ☰ <span class="stip">Account List</span>
     </div>
-    <div class="snav" id="snav-map" onclick="setView('map')">
-      🗺 <span class="stip">Customer Map</span>
-    </div>
   </nav>
 
   <!-- Main -->
@@ -1169,7 +962,6 @@ tbody td { padding:9px 12px; color:#9aa3bc; vertical-align:middle; }
         <span>Interval: <strong id="tb-interval">—</strong>s</span>
         <span>Alert at: <strong id="tb-thresh">—</strong>+ offline</span>
         <span>Billing: <strong id="tb-billing">—</strong></span>
-        <span>🔁 Flapping: <strong id="tb-flapping">—</strong></span>
       </div>
     </div>
 
@@ -1279,19 +1071,6 @@ tbody td { padding:9px 12px; color:#9aa3bc; vertical-align:middle; }
       </div>
       <!-- /Dashboard view -->
 
-      <!-- Customer Map view -->
-      <div id="view-map">
-        <div class="section-header"><span class="section-title">Customer Map</span><div class="section-line"></div></div>
-        <div class="map-legend">
-          <span><span class="dot green"></span>Online</span>
-          <span><span class="dot red"></span>Offline</span>
-          <span id="map-nocoord-note"></span>
-        </div>
-        <div id="map"></div>
-      </div>
-      <!-- /Customer Map view -->
-
-      <div id="table-section">
       <!-- Toolbar (always shown) -->
       <div class="toolbar">
         <input class="tb-input" id="search" type="text" placeholder="Search username, customer, account #, area, NAP…" oninput="applyDisplay()">
@@ -1300,7 +1079,6 @@ tbody td { padding:9px 12px; color:#9aa3bc; vertical-align:middle; }
           <button class="tb-btn active" id="btn-all"     onclick="setFilter('all')">All</button>
           <button class="tb-btn"        id="btn-online"  onclick="setFilter('online')">🟢 Online</button>
           <button class="tb-btn"        id="btn-offline" onclick="setFilter('offline')">🔴 Offline</button>
-          <button class="tb-btn"        id="btn-flapping" onclick="setFilter('flapping')">🔁 Flapping</button>
         </span>
         <div class="tb-divider"></div>
         <label class="tb-label">Sort:</label>
@@ -1312,7 +1090,6 @@ tbody td { padding:9px 12px; color:#9aa3bc; vertical-align:middle; }
           <option value="username-za">Username Z–A</option>
           <option value="customer-az">Customer A–Z</option>
           <option value="lastseen-desc">Last Seen (newest)</option>
-          <option value="flap-desc">Most flapping first</option>
         </select>
       </div>
 
@@ -1333,20 +1110,17 @@ tbody td { padding:9px 12px; color:#9aa3bc; vertical-align:middle; }
               <th>Comment</th>
               <th onclick="setSort('lastseen-desc')">Last Seen <span class="arr" id="arr-lastseen"></span></th>
               <th onclick="setSort('offline-recent')">Logged Out At <span class="arr" id="arr-logout"></span></th>
-              <th onclick="setSort('flap-desc')">Flaps <span class="arr" id="arr-flap"></span></th>
             </tr>
           </thead>
           <tbody id="tbody"></tbody>
         </table>
         <div id="no-results"></div>
       </div>
-      </div><!-- /table-section -->
 
     </div><!-- /content -->
   </div><!-- /main -->
 </div><!-- /app -->
 
-<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script>
 // ---- State ----
 let allAccounts   = [];
@@ -1358,9 +1132,6 @@ let alarmCtx      = null;
 let alarmTimer    = null;
 let wasAlert      = false;
 let cdTimer       = null;
-let map            = null;
-let mapMarkerLayer = null;
-let mapFitDone      = false;
 
 // ---- SSE ----
 const evtSource = new EventSource('/events');
@@ -1499,8 +1270,6 @@ function render(data) {
   document.getElementById('tb-billing').textContent  = !data.billingEnabled
     ? 'not configured'
     : (data.billingError ? '⚠ ' + data.billingError : (data.billingCustomerCount + ' accounts synced ' + fmt(data.billingLastSync)));
-  document.getElementById('tb-flapping').textContent = (data.flappingCount || 0) + ' account' + (data.flappingCount === 1 ? '' : 's')
-    + ' (' + (data.flapThreshold || 5) + '+ drops / ' + (data.flapWindowDays || 7) + 'd)';
 
   clearInterval(cdTimer);
   let rem = data.pollIntervalSec || 30;
@@ -1511,66 +1280,6 @@ function render(data) {
   updateCards();
   applyDisplay();
   renderIsps(data.isps);
-  if (map) updateMapMarkers();
-}
-
-// ---- Customer Map (Leaflet + OpenStreetMap — no API key needed) ----
-function ensureMap() {
-  if (map) return;
-  map = L.map('map', { attributionControl: true }).setView([10.2433, 123.7890], 13); // Minglanilla, Cebu, Philippines
-  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-    maxZoom: 19,
-    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-  }).addTo(map);
-  mapMarkerLayer = L.layerGroup().addTo(map);
-}
-
-function updateMapMarkers() {
-  if (!mapMarkerLayer) return;
-  mapMarkerLayer.clearLayers();
-
-  const withCoords = allAccounts.filter(a =>
-    typeof a.lat === 'number' && typeof a.lng === 'number' &&
-    isFinite(a.lat) && isFinite(a.lng)
-  );
-
-  withCoords.forEach(a => {
-    const online = a.status === 'online';
-    const marker = L.circleMarker([a.lat, a.lng], {
-      radius: 8,
-      color: '#fff',
-      weight: 2,
-      fillColor: online ? '#8dc63f' : '#e84040',
-      fillOpacity: 0.9,
-    });
-    const tooltipHtml = \`<div class="map-tt">
-      <div class="mtt-name">\${esc(a.customerName) || esc(a.username)}</div>
-      <div class="mtt-row">Status: <span class="mtt-status" style="color:\${online ? '#16a34a' : '#dc2626'}">\${esc(a.status)}</span></div>
-      <div class="mtt-row">Username: \${esc(a.username)}</div>
-      <div class="mtt-row">Account #: \${esc(a.accountNo) || '—'}</div>
-      <div class="mtt-row">Contact #: \${esc(a.contactNo) || '—'}</div>
-      <div class="mtt-row">Area: \${esc(a.area) || '—'}</div>
-      <div class="mtt-row">NAP Box: \${esc(a.napBox) || '—'}</div>
-      \${a.flapCount7d ? \`<div class="mtt-row" style="color:\${a.isFlapping ? '#d97706' : 'inherit'}">\${a.isFlapping ? '🔁 ' : ''}Flaps: \${a.flapCount7d}</div>\` : ''}
-    </div>\`;
-    marker.bindTooltip(tooltipHtml, { direction: 'top', sticky: true, opacity: 0.98, className: 'map-tooltip-wrap' });
-    marker.addTo(mapMarkerLayer);
-  });
-
-  const note = document.getElementById('map-nocoord-note');
-  if (note) {
-    note.textContent = allAccounts.length
-      ? \`\${withCoords.length} of \${allAccounts.length} customers have map coordinates set\`
-      : '';
-  }
-
-  // Auto-fit the view once, the first time we have pins — after that, leave
-  // the user's own pan/zoom alone on subsequent SSE refreshes.
-  if (withCoords.length && !mapFitDone) {
-    const bounds = L.latLngBounds(withCoords.map(a => [a.lat, a.lng]));
-    map.fitBounds(bounds, { padding: [30, 30], maxZoom: 15 });
-    mapFitDone = true;
-  }
 }
 
 // ---- Update donut cards ----
@@ -1620,23 +1329,15 @@ function selectCard(id) {
 function setView(v) {
   currentView = v;
   document.getElementById('view-dashboard').style.display = v==='dashboard' ? '' : 'none';
-  document.getElementById('view-map').style.display       = v==='map' ? 'flex' : 'none';
-  document.getElementById('table-section').style.display  = v==='map' ? 'none' : '';
   document.getElementById('snav-dash').classList.toggle('active',  v==='dashboard');
   document.getElementById('snav-table').classList.toggle('active', v==='table');
-  document.getElementById('snav-map').classList.toggle('active', v==='map');
   if (v==='table') { document.getElementById('filt-btns').style.display=''; document.getElementById('filt-div').style.display=''; }
-  if (v==='map') {
-    ensureMap();
-    // Container was just un-hidden — Leaflet needs a beat to see its real size.
-    setTimeout(() => { map.invalidateSize(); updateMapMarkers(); }, 60);
-  }
 }
 
 // ---- Filter ----
 function setFilter(f) {
   currentFilter = f;
-  ['all','online','offline','flapping'].forEach(id => document.getElementById('btn-'+id).classList.toggle('active', id===f));
+  ['all','online','offline'].forEach(id => document.getElementById('btn-'+id).classList.toggle('active', id===f));
   applyDisplay();
 }
 
@@ -1651,10 +1352,9 @@ const ARROW_CFG = {
   'username-za':   {col:'username',dir:'▼'},
   'lastseen-desc': {col:'lastseen',dir:'▼'},
   'customer-az':   {col:'customer',dir:'▲'},
-  'flap-desc':     {col:'flap',    dir:'▼'},
 };
 function updateArrows(v) {
-  ['status','username','customer','lastseen','logout','flap'].forEach(c => {
+  ['status','username','customer','lastseen','logout'].forEach(c => {
     const el=document.getElementById('arr-'+c); el.textContent=''; el.parentElement.classList.remove('sorted');
   });
   const cfg=ARROW_CFG[v];
@@ -1672,7 +1372,6 @@ function sortAccounts(list, v) {
     case 'username-za':    return c.sort((a,b)=> b.username.localeCompare(a.username));
     case 'lastseen-desc':  return c.sort((a,b)=> ts(b.lastSeen)-ts(a.lastSeen));
     case 'customer-az':    return c.sort((a,b)=> (a.customerName||'').localeCompare(b.customerName||''));
-    case 'flap-desc':      return c.sort((a,b)=> (b.flapCount7d||0)-(a.flapCount7d||0));
     default: return c;
   }
 }
@@ -1698,9 +1397,7 @@ function applyDisplay() {
 
   if (selectedCard === 'live' || currentView === 'table') {
     list = allAccounts.filter(a => {
-      const mf = currentFilter==='all' ? true
-        : currentFilter==='flapping' ? a.isFlapping
-        : a.status===currentFilter;
+      const mf = currentFilter==='all' || a.status===currentFilter;
       return mf && matchesQuery(a);
     });
     list = sortAccounts(list, sv);
@@ -1740,9 +1437,6 @@ function applyDisplay() {
       <td style="color:var(--dim);font-size:12px">\${esc(a.comment)||'—'}</td>
       <td style="color:var(--dim);font-size:12px">\${fmt(a.lastSeen)}</td>
       <td style="font-size:12px">\${src}</td>
-      <td style="font-size:12px">\${a.flapCount7d
-        ? (a.isFlapping ? \`<span class="badge flapping">🔁 \${a.flapCount7d}</span>\` : a.flapCount7d)
-        : '—'}</td>
     </tr>\`;
   }).join('');
 }
