@@ -120,6 +120,8 @@ if (!BILLING_ENABLED) {
 
 // ---------- State ----------
 
+const MONITOR_STARTED_AT = new Date().toISOString();
+
 let state = {
   accounts: [],
   downCount: 0,
@@ -137,6 +139,7 @@ let state = {
   billingCustomerCount: 0,
   isps: ISP_LINKS.map(isp => ({ ...isp, online: null, latencyMs: null })),
   ispsLastCheck: null,
+  monitorStartedAt: MONITOR_STARTED_AT,
 };
 
 const sseClients = new Set();
@@ -553,6 +556,13 @@ async function pollRouter() {
         }
       }
 
+      // Flap count: how many times this account has gone online -> offline
+      // since monitor.js started (see monitorStartedAt) — a modem that
+      // keeps disconnecting/reconnecting racks this up quickly, which the
+      // current-status view alone can't show. There's no database, so
+      // this resets to 0 whenever the process restarts/redeploys.
+      const flapCount = (prev ? prev.flapCount || 0 : 0) + (justWentOffline ? 1 : 0);
+
       const enrich = enrichment.map.get(username.toLowerCase()) || {};
 
       updated.push({
@@ -565,6 +575,7 @@ async function pollRouter() {
         lastSeen: isOnline ? now.toISOString() : (prev ? prev.lastSeen : null),
         lastLogout,
         logSource,
+        flapCount,
         customerName: enrich.customerName || '',
         accountNo: enrich.accountNo || '',
         contactNo: enrich.contactNo || '',
@@ -962,6 +973,7 @@ tbody td { padding:9px 12px; color:#9aa3bc; vertical-align:middle; }
         <span>Interval: <strong id="tb-interval">—</strong>s</span>
         <span>Alert at: <strong id="tb-thresh">—</strong>+ offline</span>
         <span>Billing: <strong id="tb-billing">—</strong></span>
+        <span>Flap counts since: <strong id="tb-started">—</strong></span>
       </div>
     </div>
 
@@ -1090,6 +1102,7 @@ tbody td { padding:9px 12px; color:#9aa3bc; vertical-align:middle; }
           <option value="username-za">Username Z–A</option>
           <option value="customer-az">Customer A–Z</option>
           <option value="lastseen-desc">Last Seen (newest)</option>
+          <option value="flaps-desc">Most Flaps</option>
         </select>
       </div>
 
@@ -1110,6 +1123,7 @@ tbody td { padding:9px 12px; color:#9aa3bc; vertical-align:middle; }
               <th>Comment</th>
               <th onclick="setSort('lastseen-desc')">Last Seen <span class="arr" id="arr-lastseen"></span></th>
               <th onclick="setSort('offline-recent')">Logged Out At <span class="arr" id="arr-logout"></span></th>
+              <th onclick="setSort('flaps-desc')" title="Times gone offline since the dashboard started">Flaps <span class="arr" id="arr-flaps"></span></th>
             </tr>
           </thead>
           <tbody id="tbody"></tbody>
@@ -1270,6 +1284,7 @@ function render(data) {
   document.getElementById('tb-billing').textContent  = !data.billingEnabled
     ? 'not configured'
     : (data.billingError ? '⚠ ' + data.billingError : (data.billingCustomerCount + ' accounts synced ' + fmt(data.billingLastSync)));
+  document.getElementById('tb-started').textContent = fmt(data.monitorStartedAt);
 
   clearInterval(cdTimer);
   let rem = data.pollIntervalSec || 30;
@@ -1352,9 +1367,10 @@ const ARROW_CFG = {
   'username-za':   {col:'username',dir:'▼'},
   'lastseen-desc': {col:'lastseen',dir:'▼'},
   'customer-az':   {col:'customer',dir:'▲'},
+  'flaps-desc':    {col:'flaps',   dir:'▼'},
 };
 function updateArrows(v) {
-  ['status','username','customer','lastseen','logout'].forEach(c => {
+  ['status','username','customer','lastseen','logout','flaps'].forEach(c => {
     const el=document.getElementById('arr-'+c); el.textContent=''; el.parentElement.classList.remove('sorted');
   });
   const cfg=ARROW_CFG[v];
@@ -1372,6 +1388,7 @@ function sortAccounts(list, v) {
     case 'username-za':    return c.sort((a,b)=> b.username.localeCompare(a.username));
     case 'lastseen-desc':  return c.sort((a,b)=> ts(b.lastSeen)-ts(a.lastSeen));
     case 'customer-az':    return c.sort((a,b)=> (a.customerName||'').localeCompare(b.customerName||''));
+    case 'flaps-desc':     return c.sort((a,b)=> (b.flapCount||0)-(a.flapCount||0));
     default: return c;
   }
 }
@@ -1437,6 +1454,7 @@ function applyDisplay() {
       <td style="color:var(--dim);font-size:12px">\${esc(a.comment)||'—'}</td>
       <td style="color:var(--dim);font-size:12px">\${fmt(a.lastSeen)}</td>
       <td style="font-size:12px">\${src}</td>
+      <td class="mono" style="color:\${a.flapCount>=3?'var(--red)':'var(--dim)'};font-size:12px">\${a.flapCount||0}</td>
     </tr>\`;
   }).join('');
 }
