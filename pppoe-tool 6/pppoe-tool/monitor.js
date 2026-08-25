@@ -454,6 +454,18 @@ function parseRouterOsTime(raw) {
   return null;
 }
 
+// RouterOS reports session uptime as a compact duration string on each
+// active connection — e.g. "1w2d3h4m5s", "2h34m1s", "10m2s", "45s".
+// Converted to seconds so the column can be sorted numerically; the raw
+// string is kept for display since it's already human-readable.
+function parseRouterOsUptime(raw) {
+  if (!raw) return null;
+  const m = String(raw).match(/^(?:(\d+)w)?(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$/);
+  if (!m || !m.slice(1).some(Boolean)) return null;
+  const [w, d, h, min, s] = m.slice(1).map(v => parseInt(v || '0', 10));
+  return w * 604800 + d * 86400 + h * 3600 + min * 60 + s;
+}
+
 // Fetches TaokiNinam's customer CSV export purely for enrichment. Never
 // throws — a failure here just means blank customer fields, since router
 // status/timestamps don't depend on it. Keyed by lowercased username so
@@ -576,6 +588,12 @@ async function pollRouter() {
         lastLogout,
         logSource,
         flapCount,
+        // Current session uptime, straight from the router's active
+        // connection record. Only meaningful while online — an offline
+        // account has no active session, so this clears rather than
+        // showing a stale duration from its last session.
+        uptime: isOnline ? (active.uptime || '') : '',
+        uptimeSec: isOnline ? parseRouterOsUptime(active.uptime) : null,
         customerName: enrich.customerName || '',
         accountNo: enrich.accountNo || '',
         contactNo: enrich.contactNo || '',
@@ -1103,6 +1121,8 @@ tbody td { padding:9px 12px; color:#9aa3bc; vertical-align:middle; }
           <option value="customer-az">Customer A–Z</option>
           <option value="lastseen-desc">Last Seen (newest)</option>
           <option value="flaps-desc">Most Flaps</option>
+          <option value="uptime-desc">Uptime (longest first)</option>
+          <option value="uptime-asc">Uptime (shortest first)</option>
         </select>
       </div>
 
@@ -1121,6 +1141,7 @@ tbody td { padding:9px 12px; color:#9aa3bc; vertical-align:middle; }
               <th>Profile</th>
               <th>Remote IP</th>
               <th>Comment</th>
+              <th onclick="setSort('uptime-desc')" title="How long the current session has been up (online accounts only)">Uptime <span class="arr" id="arr-uptime"></span></th>
               <th onclick="setSort('lastseen-desc')">Last Seen <span class="arr" id="arr-lastseen"></span></th>
               <th onclick="setSort('offline-recent')">Logged Out At <span class="arr" id="arr-logout"></span></th>
               <th onclick="setSort('flaps-desc')" title="Times gone offline since the dashboard started">Flaps <span class="arr" id="arr-flaps"></span></th>
@@ -1368,9 +1389,11 @@ const ARROW_CFG = {
   'lastseen-desc': {col:'lastseen',dir:'▼'},
   'customer-az':   {col:'customer',dir:'▲'},
   'flaps-desc':    {col:'flaps',   dir:'▼'},
+  'uptime-desc':   {col:'uptime',  dir:'▼'},
+  'uptime-asc':    {col:'uptime',  dir:'▲'},
 };
 function updateArrows(v) {
-  ['status','username','customer','lastseen','logout','flaps'].forEach(c => {
+  ['status','username','customer','lastseen','logout','flaps','uptime'].forEach(c => {
     const el=document.getElementById('arr-'+c); el.textContent=''; el.parentElement.classList.remove('sorted');
   });
   const cfg=ARROW_CFG[v];
@@ -1389,6 +1412,10 @@ function sortAccounts(list, v) {
     case 'lastseen-desc':  return c.sort((a,b)=> ts(b.lastSeen)-ts(a.lastSeen));
     case 'customer-az':    return c.sort((a,b)=> (a.customerName||'').localeCompare(b.customerName||''));
     case 'flaps-desc':     return c.sort((a,b)=> (b.flapCount||0)-(a.flapCount||0));
+    // Offline accounts have no session uptime — keep them at the bottom of
+    // both directions rather than letting them masquerade as "0 seconds".
+    case 'uptime-desc':    return c.sort((a,b)=>{ const x=a.uptimeSec,y=b.uptimeSec; if(x==null&&y==null) return a.username.localeCompare(b.username); if(x==null) return 1; if(y==null) return -1; return y-x; });
+    case 'uptime-asc':     return c.sort((a,b)=>{ const x=a.uptimeSec,y=b.uptimeSec; if(x==null&&y==null) return a.username.localeCompare(b.username); if(x==null) return 1; if(y==null) return -1; return x-y; });
     default: return c;
   }
 }
@@ -1452,6 +1479,7 @@ function applyDisplay() {
       <td style="color:var(--dim);font-size:12px">\${esc(a.profile)||'—'}</td>
       <td class="mono" style="color:var(--dim);font-size:12px">\${esc(a.remoteIp)||'—'}</td>
       <td style="color:var(--dim);font-size:12px">\${esc(a.comment)||'—'}</td>
+      <td class="mono" style="color:\${a.uptime?'var(--green)':'var(--dim)'};font-size:12px">\${esc(a.uptime)||'—'}</td>
       <td style="color:var(--dim);font-size:12px">\${fmt(a.lastSeen)}</td>
       <td style="font-size:12px">\${src}</td>
       <td class="mono" style="color:\${a.flapCount>=3?'var(--red)':'var(--dim)'};font-size:12px">\${a.flapCount||0}</td>
