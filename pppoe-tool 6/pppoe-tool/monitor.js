@@ -103,6 +103,12 @@ const BILLING_PASSWORD = process.env.TAOKININAM_PASSWORD;
 const BILLING_DEBUG    = String(process.env.BILLING_DEBUG || '').toLowerCase() === 'true';
 const BILLING_ENABLED  = Boolean(BILLING_USERNAME && BILLING_PASSWORD);
 
+// ---- service-to-service API ----
+// The ticketing system asks this monitor "who is this customer, and are they
+// (and their neighbours on the same NAP) online?". That answer carries customer
+// contact details, so /api/customers is closed unless a shared key is set.
+const API_TOKEN = process.env.API_TOKEN || '';
+
 // ---- ISP uplink monitoring (pings each gateway IP directly from this machine) ----
 // Edit this list to add/remove/rename ISP links.
 const ISP_LINKS = [
@@ -1491,6 +1497,66 @@ function applyDisplay() {
 </html>`;
 }
 
+// ---------- customer lookup for the ticketing system ----------
+
+// napBox arrives from billing as "NAP / PORT" (e.g. "NAP-BRGY1-014 / 5").
+// The box name alone is what groups neighbours together.
+function napNameOf(napBox) {
+  const s = String(napBox || '').trim();
+  if (!s) return '';
+  const i = s.indexOf(' / ');
+  return (i === -1 ? s : s.slice(0, i)).trim();
+}
+
+// Only the fields a ticket needs — no router internals.
+function publicAccount(a) {
+  return {
+    username:     a.username,
+    accountNo:    a.accountNo || '',
+    customerName: a.customerName || '',
+    contactNo:    a.contactNo || '',
+    area:         a.area || '',
+    napBox:       a.napBox || '',
+    napName:      napNameOf(a.napBox),
+    status:       a.status,
+    uptime:       a.uptime || '',
+    lastSeen:     a.lastSeen || null,
+    lastLogout:   a.lastLogout || null,
+  };
+}
+
+/* The question a technician actually needs answered before riding out: is this
+   one subscriber's drop wire, or is the whole NAP dark? */
+function napContext(napName) {
+  if (!napName) return null;
+  const peers = state.accounts.filter(a => napNameOf(a.napBox) === napName);
+  if (!peers.length) return null;
+  const offline = peers.filter(a => a.status === 'offline');
+  return {
+    napName,
+    total:   peers.length,
+    offline: offline.length,
+    online:  peers.length - offline.length,
+    offlineUsernames: offline.map(a => a.username),
+    // Every subscriber on the box down at once points upstream of the box.
+    wholeNapDown: peers.length > 1 && offline.length === peers.length,
+  };
+}
+
+function matchesQuery(a, q) {
+  if (!q) return true;
+  return [a.username, a.customerName, a.accountNo, a.contactNo, a.area, a.napBox]
+    .some(v => String(v || '').toLowerCase().includes(q));
+}
+
+// Constant-time compare so the shared key can't be probed byte by byte.
+function keyMatches(supplied) {
+  const crypto = require('crypto');
+  const a = Buffer.from(String(supplied || ''));
+  const b = Buffer.from(API_TOKEN);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
 // ---------- HTTP Server ----------
 
 const server = http.createServer((req, res) => {
@@ -1520,6 +1586,53 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(state.isps, null, 2));
     return;
+  }
+
+  /* ---- customer lookup (service-to-service; used by the ticketing system) ----
+     GET /api/customers?q=dela+cruz        -> matching customers, live status included
+     GET /api/customers/<pppoe-username>   -> one customer plus their NAP's context
+     Auth: X-Api-Key header (or ?key= for quick manual checks). */
+  if (req.url.startsWith('/api/customers')) {
+    const u = new URL(req.url, 'http://x');
+    const send = (code, body) => {
+      res.writeHead(code, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(body));
+    };
+
+    if (!API_TOKEN) {
+      return send(503, { error: 'Customer lookup is disabled: set API_TOKEN on this service to enable it.' });
+    }
+    if (!keyMatches(req.headers['x-api-key'] || u.searchParams.get('key'))) {
+      return send(401, { error: 'Bad or missing API key' });
+    }
+    if (!state.lastPoll) {
+      return send(503, { error: 'Monitor has not completed its first poll yet — try again shortly.' });
+    }
+
+    const rest = u.pathname.slice('/api/customers'.length).replace(/^\//, '');
+    const meta = {
+      billingLastSync: state.billingLastSync,
+      billingError:    state.billingError,
+      lastPoll:        state.lastPoll,
+    };
+
+    if (rest) {
+      const username = decodeURIComponent(rest).toLowerCase();
+      const found = state.accounts.find(a => String(a.username || '').toLowerCase() === username);
+      if (!found) return send(404, { error: 'No PPPoE account by that username', username });
+      const customer = publicAccount(found);
+      return send(200, { customer, nap: napContext(customer.napName), meta });
+    }
+
+    const q = String(u.searchParams.get('q') || '').trim().toLowerCase();
+    const limit = Math.min(Math.max(parseInt(u.searchParams.get('limit') || '25', 10) || 25, 1), 100);
+    const all = state.accounts.filter(a => matchesQuery(a, q));
+    return send(200, {
+      count: all.length,
+      truncated: all.length > limit,
+      customers: all.slice(0, limit).map(publicAccount),
+      meta,
+    });
   }
 
   res.writeHead(200, { 'Content-Type': 'text/html' });
