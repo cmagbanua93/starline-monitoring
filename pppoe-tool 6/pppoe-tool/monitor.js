@@ -1693,6 +1693,62 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  /* ---- NAP / area list (service-to-service; feeds the FTTH map's Area picker) ----
+     GET /api/naps  -> every distinct NAP box and area code billing knows about,
+                       with how many subscribers sit on each and how many are down.
+     Counts only — no names or contact numbers, because this only fills a dropdown. */
+  if (path === '/api/naps') {
+    const send = (code, body) => {
+      res.writeHead(code, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(body));
+    };
+    if (!state.lastPoll) {
+      return send(503, { error: 'Monitor has not completed its first poll yet — try again shortly.' });
+    }
+
+    /* One pass over the accounts, grouped both ways: the FTTH map can key on
+       whichever column this billing export actually maintains. */
+    const byNap = new Map();
+    const byArea = new Map();
+    const bump = (map, key, account, partnerKey, partnerField) => {
+      if (!key) return;
+      if (!map.has(key)) map.set(key, { customers: 0, offline: 0, partners: new Set() });
+      const row = map.get(key);
+      row.customers += 1;
+      if (account.status === 'offline') row.offline += 1;
+      if (partnerKey) row.partners.add(partnerKey);
+    };
+
+    for (const a of state.accounts) {
+      const napName = napNameOf(a.napBox);
+      const area = String(a.area || '').trim();
+      bump(byNap, napName, a, area);
+      bump(byArea, area, a, napName);
+    }
+
+    const shape = (map, keyName, partnerName) =>
+      [...map.entries()]
+        .map(([key, v]) => ({
+          [keyName]: key,
+          [partnerName]: [...v.partners].sort(),
+          customers: v.customers,
+          online: v.customers - v.offline,
+          offline: v.offline,
+          wholeGroupDown: v.customers > 1 && v.offline === v.customers,
+        }))
+        .sort((x, y) => String(x[keyName]).localeCompare(String(y[keyName])));
+
+    return send(200, {
+      naps:  shape(byNap, 'napName', 'areas'),
+      areas: shape(byArea, 'area', 'napNames'),
+      meta: {
+        billingLastSync: state.billingLastSync,
+        billingError:    state.billingError,
+        lastPoll:        state.lastPoll,
+      },
+    });
+  }
+
   /* ---- customer lookup (service-to-service; used by the ticketing system) ----
      GET /api/customers?q=dela+cruz        -> matching customers, live status included
      GET /api/customers/<pppoe-username>   -> one customer plus their NAP's context
