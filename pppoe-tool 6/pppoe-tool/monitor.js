@@ -109,6 +109,15 @@ const BILLING_ENABLED  = Boolean(BILLING_USERNAME && BILLING_PASSWORD);
 // contact details, so /api/customers is closed unless a shared key is set.
 const API_TOKEN = process.env.API_TOKEN || '';
 
+// ---- dashboard sign-in ----
+// The dashboard and its data feed carry every subscriber's name, account number
+// and contact number, so they are closed to anyone without the password. A
+// browser cannot set headers on an EventSource, so the browser gets a signed
+// cookie; services keep using X-Api-Key.
+const DASHBOARD_PASSWORD = process.env.DASHBOARD_PASSWORD || '';
+const SESSION_SECRET = process.env.SESSION_SECRET ||
+  require('crypto').randomBytes(24).toString('hex');
+
 // ---- ISP uplink monitoring (pings each gateway IP directly from this machine) ----
 // Edit this list to add/remove/rename ISP links.
 const ISP_LINKS = [
@@ -1557,15 +1566,111 @@ function keyMatches(supplied) {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
+// ---------- dashboard auth ----------
+
+function sessionToken() {
+  const crypto = require('crypto');
+  return crypto.createHmac('sha256', SESSION_SECRET).update('starline-monitor-v1').digest('hex');
+}
+
+function cookieOf(req, name) {
+  const raw = req.headers.cookie || '';
+  for (const part of raw.split(';')) {
+    const i = part.indexOf('=');
+    if (i === -1) continue;
+    if (part.slice(0, i).trim() === name) return part.slice(i + 1).trim();
+  }
+  return '';
+}
+
+/* A signed cookie (browser) or the service key (ticketing system). Fails closed:
+   with no DASHBOARD_PASSWORD set, nothing is served rather than everything. */
+function authed(req) {
+  const u = new URL(req.url, 'http://x');
+  if (API_TOKEN && keyMatches(req.headers['x-api-key'] || u.searchParams.get('key'))) return true;
+  if (!DASHBOARD_PASSWORD) return false;
+  const supplied = Buffer.from(cookieOf(req, 'sl_monitor'));
+  const expected = Buffer.from(sessionToken());
+  return supplied.length === expected.length &&
+    require('crypto').timingSafeEqual(supplied, expected);
+}
+
+function loginPage(message) {
+  return `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>StarLine Monitor</title>
+<style>body{background:#0b1220;color:#e2e8f0;font-family:-apple-system,Segoe UI,Roboto,sans-serif;display:flex;
+min-height:100vh;align-items:center;justify-content:center;margin:0}
+form{background:#111c31;padding:26px;border-radius:14px;width:300px;box-shadow:0 10px 40px rgba(0,0,0,.45)}
+h1{font-size:17px;margin:0 0 4px}p{font-size:12.5px;color:#93a4bd;margin:0 0 16px}
+input{width:100%;padding:11px;border-radius:9px;border:1px solid #27374f;background:#0b1220;color:#e2e8f0;
+font-size:15px;box-sizing:border-box}
+button{width:100%;margin-top:12px;padding:11px;border:0;border-radius:9px;background:#f2c230;color:#0b1220;
+font-weight:700;font-size:15px;cursor:pointer}
+.err{color:#fca5a5;font-size:12.5px;margin-top:10px}</style>
+<form method="POST" action="/login">
+  <h1>StarLine PPPoE Monitor</h1>
+  <p>Subscriber data — sign in to continue.</p>
+  <input type="password" name="password" placeholder="Password" autofocus autocomplete="current-password">
+  <button type="submit">Sign in</button>
+  ${message ? `<div class="err">${message}</div>` : ''}
+</form>`;
+}
+
 // ---------- HTTP Server ----------
 
 const server = http.createServer((req, res) => {
+  const path = req.url.split('?')[0];
+
+  /* ---- sign in ---- */
+  if (path === '/login' && req.method === 'POST') {
+    let body = '';
+    req.on('data', c => { body += c; if (body.length > 4096) req.destroy(); });
+    req.on('end', () => {
+      const supplied = decodeURIComponent(
+        (new URLSearchParams(body).get('password') || '').replace(/\+/g, ' '));
+      if (!DASHBOARD_PASSWORD) {
+        res.writeHead(503, { 'Content-Type': 'text/html' });
+        return res.end(loginPage('DASHBOARD_PASSWORD is not set on this service.'));
+      }
+      const a = Buffer.from(supplied), b = Buffer.from(DASHBOARD_PASSWORD);
+      const ok = a.length === b.length && require('crypto').timingSafeEqual(a, b);
+      if (!ok) {
+        res.writeHead(401, { 'Content-Type': 'text/html' });
+        return res.end(loginPage('Wrong password.'));
+      }
+      res.writeHead(302, {
+        'Set-Cookie': `sl_monitor=${sessionToken()}; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000${
+          req.headers['x-forwarded-proto'] === 'https' ? '; Secure' : ''}`,
+        Location: '/',
+      });
+      res.end();
+    });
+    return;
+  }
+  if (path === '/login') {
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    return res.end(loginPage(''));
+  }
+  if (path === '/logout') {
+    res.writeHead(302, { 'Set-Cookie': 'sl_monitor=; Path=/; Max-Age=0', Location: '/login' });
+    return res.end();
+  }
+
+  /* ---- everything past here is subscriber data ---- */
+  if (!authed(req)) {
+    if (path.startsWith('/api/') || path === '/events') {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: 'Not signed in' }));
+    }
+    res.writeHead(401, { 'Content-Type': 'text/html' });
+    return res.end(loginPage(DASHBOARD_PASSWORD ? '' : 'DASHBOARD_PASSWORD is not set on this service.'));
+  }
+
   if (req.url === '/events') {
     res.writeHead(200, {
       'Content-Type':  'text/event-stream',
       'Cache-Control': 'no-cache',
       'Connection':    'keep-alive',
-      'Access-Control-Allow-Origin': '*',
     });
     res.flushHeaders();
     res.write(`data: ${JSON.stringify(state)}\n\n`);
