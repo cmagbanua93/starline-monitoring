@@ -485,6 +485,342 @@ function parseRouterOsUptime(raw) {
 // throws — a failure here just means blank customer fields, since router
 // status/timestamps don't depend on it. Keyed by lowercased username so
 // the join with the router's PPPoE secret name is case-insensitive.
+/* ---------- writing back to TaokiNinam ----------
+ *
+ * Reading the billing export is safe; writing to it is not. Three things about
+ * this app shape everything below:
+ *
+ *  1. editRecords.php posts EVERY field on the form. Sending only the fields we
+ *     care about blanks the rest — email, credit limit, the external URLs — so a
+ *     write is always read-modify-write against the live form.
+ *  2. The three steps are a chain, not a set. TaokiNinam sends the subscriber a
+ *     welcome SMS once details are complete, billing is active and a plan is
+ *     chosen. If step 1 half-succeeds and step 3 still runs, a real customer is
+ *     texted about an account that was never filled in properly. So each step
+ *     verifies before the next one starts, and a failure stops the chain.
+ *  3. Nobody is reviewing these. Every push is logged, and anything already done
+ *     is skipped rather than repeated.
+ */
+
+/* A GET that survives an expired PHP session. */
+async function billingGet(path) {
+  if (!billingCookie) await billingLogin();
+  const url = BILLING_BASE_URL + path;
+  const once = () => fetch(url, {
+    headers: { Cookie: billingCookie, 'User-Agent': 'Mozilla/5.0 (compatible; monitor.js)' },
+    redirect: 'manual',
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+  });
+  let res = await once();
+  if (res.status === 302 || res.status === 301) { await billingLogin(); res = await once(); }
+  const text = await res.text();
+  if (/name=["']cpassword["']/.test(text)) {          // bounced to the login form
+    await billingLogin();
+    res = await once();
+    return res.text();
+  }
+  return text;
+}
+
+async function billingPost(path, params) {
+  if (!billingCookie) await billingLogin();
+  const url = BILLING_BASE_URL + path;
+  const body = new URLSearchParams(params).toString();
+  const once = () => fetch(url, {
+    method: 'POST',
+    headers: {
+      Cookie: billingCookie,
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'User-Agent': 'Mozilla/5.0 (compatible; monitor.js)',
+    },
+    body,
+    redirect: 'manual',
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+  });
+  let res = await once();
+  if (res.status === 401 || res.status === 403) { await billingLogin(); res = await once(); }
+  return { status: res.status, location: res.headers.get('location') || '' };
+}
+
+/* Reads the current values out of a rendered TaokiNinam form so a write can put
+   them back unchanged. Deliberately tolerant: attributes appear in any order and
+   the markup is hand-written PHP. */
+function parseFormFields(html, actionMatch) {
+  const forms = [];
+  const re = /<form\b([^>]*)>([\s\S]*?)<\/form>/gi;
+  let m;
+  while ((m = re.exec(html))) forms.push({ attrs: m[1], inner: m[2] });
+  const form = forms.find(f => new RegExp('action\\s*=\\s*["\'][^"\']*' + actionMatch, 'i').test(f.attrs));
+  if (!form) return null;
+
+  const attr = (tag, name) => {
+    const r = new RegExp(name + '\\s*=\\s*("([^"]*)"|\'([^\']*)\'|([^\\s>]+))', 'i').exec(tag);
+    if (!r) return null;
+    return r[2] !== undefined ? r[2] : r[3] !== undefined ? r[3] : r[4];
+  };
+  const unescape = (v) => String(v == null ? '' : v)
+    .replace(/&quot;/g, '"').replace(/&#0?39;/g, "'").replace(/&apos;/g, "'")
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+
+  const out = {};
+  /* inputs — radios and checkboxes only count when checked, exactly as a browser
+     would submit them */
+  const inputRe = /<input\b[^>]*>/gi;
+  let t;
+  while ((t = inputRe.exec(form.inner))) {
+    const tag = t[0];
+    const name = attr(tag, 'name');
+    if (!name) continue;
+    const type = (attr(tag, 'type') || 'text').toLowerCase();
+    if (type === 'submit' || type === 'button' || type === 'file' || type === 'reset') continue;
+    if (type === 'radio' || type === 'checkbox') {
+      if (/\schecked\b/i.test(tag)) out[name] = unescape(attr(tag, 'value') || 'on');
+      else if (!(name in out)) out[name] = out[name] || '';
+      continue;
+    }
+    out[name] = unescape(attr(tag, 'value') || '');
+  }
+  /* selects — the selected option, or the first one, as a browser would */
+  const selRe = /<select\b([^>]*)>([\s\S]*?)<\/select>/gi;
+  while ((t = selRe.exec(form.inner))) {
+    const name = attr(t[1], 'name');
+    if (!name) continue;
+    const opts = [];
+    const optRe = /<option\b([^>]*)>([\s\S]*?)<\/option>/gi;
+    let o;
+    while ((o = optRe.exec(t[2]))) {
+      const val = attr(o[1], 'value');
+      opts.push({ value: unescape(val === null ? o[2].trim() : val), selected: /\sselected\b/i.test(o[1]) });
+    }
+    const chosen = opts.find(x => x.selected) || opts[0];
+    out[name] = chosen ? chosen.value : '';
+  }
+  /* textareas */
+  const taRe = /<textarea\b([^>]*)>([\s\S]*?)<\/textarea>/gi;
+  while ((t = taRe.exec(form.inner))) {
+    const name = attr(t[1], 'name');
+    if (name) out[name] = unescape(t[2]);
+  }
+  return out;
+}
+
+/* The options a select will actually accept — used to refuse an area or plan
+   TaokiNinam does not know, rather than silently writing a blank. */
+function parseSelectOptions(html, selectName) {
+  const re = new RegExp('<select\\b[^>]*name\\s*=\\s*["\']' + selectName + '["\'][^>]*>([\\s\\S]*?)<\\/select>', 'i');
+  const m = re.exec(html);
+  if (!m) return [];
+  const out = [];
+  const optRe = /<option\b([^>]*)>([\s\S]*?)<\/option>/gi;
+  let o;
+  while ((o = optRe.exec(m[1]))) {
+    const vm = /value\s*=\s*"([^"]*)"/i.exec(o[1]);
+    const text = o[2].replace(/<[^>]*>/g, '').trim();
+    const value = vm ? vm[1] : text;
+    if (value) out.push({ value, text });
+  }
+  return out;
+}
+
+/* The billing record for a PPPoE username, straight from the export, including
+   its internal id and enough current state to know what still needs doing. */
+async function billingFindRecord(username) {
+  const want = String(username || '').trim().toLowerCase();
+  if (!want) throw new Error('no PPPoE username supplied');
+  const rows = parseCsv(await billingFetchCsv());
+  if (!rows.length) throw new Error('billing export returned no rows');
+  const header = rows[0];
+  const idx = name => header.indexOf(name);
+  const iUser = idx('USERNAME');
+  if (iUser === -1) throw new Error('billing export has no USERNAME column');
+
+  const hits = [];
+  for (let r = 1; r < rows.length; r++) {
+    if ((rows[r][iUser] || '').trim().toLowerCase() === want) hits.push(rows[r]);
+  }
+  if (!hits.length) throw new Error(`no billing record has the PPPoE username "${username}"`);
+  if (hits.length > 1) throw new Error(`${hits.length} billing records share the PPPoE username "${username}" — refusing to guess which one to update`);
+
+  const row = hits[0];
+  const get = n => (idx(n) === -1 ? '' : (row[idx(n)] || '').trim());
+  return {
+    id: get('ID'), account: get('ACCOUNT'),
+    fname: get('FNAME'), lname: get('LNAME'), area: get('AREA'),
+    username: get('USERNAME'), password: get('PASSWORD'),
+    billing: get('BILLING'), products: get('PRODUCTS'), profile: get('PROFILE'),
+    dueDate: get('DUEDATE'), billDate: get('BILLDATE'),
+    nap: get('NAP'), port: get('PORT'), phone: get('PHONE'),
+  };
+}
+
+/* Due date = installation date + one calendar month. Overshoot is clamped to the
+   last day of the target month, so a 31 Jan install lands on 28/29 Feb rather
+   than skipping into March. */
+function addOneMonth(isoDate) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(isoDate || ''));
+  if (!m) return '';
+  const y = +m[1], mo = +m[2], d = +m[3];
+  const targetY = mo === 12 ? y + 1 : y;
+  const targetM = mo === 12 ? 1 : mo + 1;
+  const lastDay = new Date(Date.UTC(targetY, targetM, 0)).getUTCDate();
+  const day = Math.min(d, lastDay);
+  return `${targetY}-${String(targetM).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+}
+
+/* Billing counts as already switched on if TaokiNinam reports a billing type. */
+function billingIsActive(rec) {
+  const v = String(rec.billing || '').trim().toLowerCase();
+  return v !== '' && v !== '0' && v !== 'inactive' && v !== 'none';
+}
+
+const billingPushLog = [];
+function logPush(entry) {
+  billingPushLog.push(Object.assign({ ts: new Date().toISOString() }, entry));
+  if (billingPushLog.length > 500) billingPushLog.splice(0, billingPushLog.length - 500);
+}
+
+/* The catalogues TaokiNinam owns. Read live so adding a plan or an area in
+   billing needs no change here or in the ticketing app. */
+let catalogCache = { at: 0, data: null };
+async function billingCatalog() {
+  if (catalogCache.data && Date.now() - catalogCache.at < 10 * 60 * 1000) return catalogCache.data;
+  const [addHtml, prodHtml] = await Promise.all([
+    billingGet('/addRecord.php'),
+    billingGet('/products.php'),
+  ]);
+  const areas = parseSelectOptions(addHtml, 'area').map(o => o.value).filter(v => v && !/^select /i.test(v));
+  /* products.php renders one row per plan: id, name, profile group, type, price */
+  const products = [];
+  const rowRe = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
+  let r;
+  while ((r = rowRe.exec(prodHtml))) {
+    const cells = [];
+    const cRe = /<td[^>]*>([\s\S]*?)<\/td>/gi;
+    let c;
+    while ((c = cRe.exec(r[1]))) cells.push(c[1].replace(/<[^>]*>/g, '').replace(/&amp;/g, '&').trim());
+    if (cells.length >= 5 && cells[1] && cells[2] && /^\d+$/.test(cells[0])) {
+      products.push({ name: cells[1], profile: cells[2], price: cells[4] });
+    }
+  }
+  const data = { areas, products };
+  catalogCache = { at: Date.now(), data };
+  return data;
+}
+
+/* ---- the push ----
+ * Order is fixed and each step is verified before the next: details, then
+ * billing, then the plan. TaokiNinam sends the welcome SMS at the end of that
+ * chain, so a half-finished record must never reach step three. */
+async function billingPush(input) {
+  const steps = [];
+  const record = await billingFindRecord(input.username);
+  const id = record.id;
+  if (!id) throw new Error('billing record has no id — cannot address it');
+
+  const catalog = await billingCatalog();
+  const area = String(input.area || '').trim();
+  if (area && !catalog.areas.includes(area)) {
+    throw new Error(`"${area}" is not one of the areas TaokiNinam offers — refusing to write an area billing does not know`);
+  }
+  const plan = String(input.plan || '').trim();
+  const product = catalog.products.find(pr => pr.name.toLowerCase() === plan.toLowerCase());
+  if (plan && !product) {
+    throw new Error(`"${plan}" is not a product in TaokiNinam — refusing to guess a plan`);
+  }
+
+  /* ---- step 1: the record itself ---- */
+  const editHtml = await billingGet(`/editRecord.php?id=${encodeURIComponent(id)}`);
+  const current = parseFormFields(editHtml, 'editRecords');
+  if (!current) throw new Error('could not read the current record form — TaokiNinam may have changed its markup');
+
+  /* Only ever overwrite with something. An empty ticket field leaves billing
+     as it was rather than erasing what is already there. */
+  const keep = (val, existing) => {
+    const v = String(val == null ? '' : val).trim();
+    return v === '' ? (existing || '') : v;
+  };
+  const payload = Object.assign({}, current);
+  payload.fname       = keep(input.fname, current.fname);
+  payload.lname       = keep(input.lname, current.lname);
+  payload.address     = keep(input.address, current.address);
+  payload.area        = keep(area, current.area);
+  payload.phone       = keep(input.phone, current.phone);
+  payload.coordinates = keep(input.coordinates, current.coordinates);
+  payload.civil       = keep(input.installDate, current.civil);     // Installation Date
+  payload.citizenship = keep(input.username, current.citizenship);  // account Remarks
+  payload.nap         = keep(area, current.nap);                    // NAP mirrors the Area
+  payload.nport       = keep(input.port, current.nport);
+  if (input.email) payload.email = keep(input.email, current.email);
+  payload.submit = current.submit || 'Submit';
+
+  const r1 = await billingPost(`/actions/editRecords.php?id=${encodeURIComponent(id)}`, payload);
+  const after1 = await billingFindRecord(input.username);
+  const landed = (want, got) => !want || String(got || '').trim().toLowerCase() === String(want).trim().toLowerCase();
+  if (!landed(input.fname, after1.fname) || !landed(input.lname, after1.lname) || !landed(area, after1.area)) {
+    steps.push({ step: 'details', status: 'failed', http: r1.status,
+      detail: 'the record did not come back with the values that were sent' });
+    logPush({ username: input.username, id, ok: false, steps });
+    return { ok: false, recordId: id, steps };
+  }
+  steps.push({ step: 'details', status: 'done', http: r1.status });
+
+  /* ---- step 2: billing ---- */
+  if (billingIsActive(after1)) {
+    /* Re-running must never move a due date that is already live. */
+    steps.push({ step: 'billing', status: 'skipped',
+      detail: `billing is already active (due ${after1.dueDate || 'unknown'}) — left untouched` });
+  } else {
+    const dueDate = input.dueDate || addOneMonth(input.installDate);
+    if (!dueDate) {
+      steps.push({ step: 'billing', status: 'failed', detail: 'no installation date, so no due date could be worked out' });
+      logPush({ username: input.username, id, ok: false, steps });
+      return { ok: false, recordId: id, steps };
+    }
+    const r2 = await billingPost(`/actions/billingToggle.php?id=${encodeURIComponent(id)}`, {
+      substype: input.substype || 'postpaid',
+      billing: dueDate,
+      billdays: String(input.billdays == null ? 10 : input.billdays),
+      submit: 'Submit',
+    });
+    const after2 = await billingFindRecord(input.username);
+    if (!billingIsActive(after2)) {
+      steps.push({ step: 'billing', status: 'failed', http: r2.status,
+        detail: 'billing still reads inactive after the activation was posted' });
+      logPush({ username: input.username, id, ok: false, steps });
+      return { ok: false, recordId: id, steps };
+    }
+    steps.push({ step: 'billing', status: 'done', http: r2.status, dueDate, billdays: input.billdays == null ? 10 : input.billdays });
+  }
+
+  /* ---- step 3: the plan (this is what triggers the welcome SMS) ---- */
+  if (!product) {
+    steps.push({ step: 'plan', status: 'skipped', detail: 'no plan on the ticket, so nothing to sync' });
+    logPush({ username: input.username, id, ok: true, steps });
+    return { ok: true, recordId: id, steps };
+  }
+  const detHtml = await billingGet(`/recordDetails.php?id=${encodeURIComponent(id)}`);
+  const svc = parseFormFields(detHtml, 'accountSettings') || {};
+  const svcPayload = Object.assign({}, svc, {
+    service: input.service || 'pppoe',
+    products: product.name,
+    profile_pppoe: product.profile,
+    username: keep(record.username, svc.username),
+    password: keep(record.password, svc.password),
+    submit: svc.submit || 'Submit',
+  });
+  const r3 = await billingPost(`/actions/accountSettings.php?id=${encodeURIComponent(id)}`, svcPayload);
+  const after3 = await billingFindRecord(input.username);
+  if (String(after3.products || '').trim().toLowerCase() !== product.name.toLowerCase()) {
+    steps.push({ step: 'plan', status: 'failed', http: r3.status,
+      detail: `billing still shows "${after3.products || 'no plan'}" instead of "${product.name}"` });
+    logPush({ username: input.username, id, ok: false, steps });
+    return { ok: false, recordId: id, steps };
+  }
+  steps.push({ step: 'plan', status: 'done', http: r3.status, product: product.name, profile: product.profile });
+  logPush({ username: input.username, id, ok: true, steps });
+  return { ok: true, recordId: id, steps };
+}
+
 async function fetchBillingEnrichment() {
   if (!BILLING_ENABLED) return { map: new Map(), error: null };
   try {
@@ -1618,7 +1954,23 @@ font-weight:700;font-size:15px;cursor:pointer}
 
 // ---------- HTTP Server ----------
 
+/* The handler is async because the billing write is. An async handler that
+   rejects is an unhandled rejection, which in Node 22 takes the process down —
+   so nothing may escape this wrapper. Monitoring staying up matters more than
+   any single request. */
 const server = http.createServer((req, res) => {
+  handleRequest(req, res).catch(err => {
+    console.error('[http] request failed:', err && err.message);
+    if (!res.headersSent) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'request failed' }));
+    } else {
+      try { res.end(); } catch (_) {}
+    }
+  });
+});
+
+async function handleRequest(req, res) {
   const path = req.url.split('?')[0];
 
   /* ---- sign in ---- */
@@ -1697,6 +2049,51 @@ const server = http.createServer((req, res) => {
      GET /api/naps  -> every distinct NAP box and area code billing knows about,
                        with how many subscribers sit on each and how many are down.
      Counts only — no names or contact numbers, because this only fills a dropdown. */
+  /* The catalogues billing owns — areas and plans — so the ticketing app never
+     keeps its own copy that can drift out of date. */
+  if (path === '/api/billing-catalog') {
+    const send = (code, body) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(body)); };
+    if (!BILLING_ENABLED) return send(503, { error: 'Billing is not configured on this service.' });
+    try {
+      const c = await billingCatalog();
+      return send(200, { areas: c.areas, products: c.products });
+    } catch (e) {
+      return send(502, { error: describeFetchError(e) });
+    }
+  }
+
+  /* The write. Service key only — never a dashboard cookie, because this one
+     changes what a subscriber is charged and ends by texting them. */
+  if (path === '/api/billing-push') {
+    const send = (code, body) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(body)); };
+    if (req.method !== 'POST') return send(405, { error: 'POST only' });
+    if (!API_TOKEN || !keyMatches(req.headers['x-api-key'] || '')) {
+      return send(401, { error: 'Not authorised' });
+    }
+    if (!BILLING_ENABLED) return send(503, { error: 'Billing is not configured on this service.' });
+    let body = '';
+    try {
+      await new Promise((resolve, reject) => {
+        req.on('data', c => { body += c; if (body.length > 64 * 1024) { req.destroy(); reject(new Error('payload too large')); } });
+        req.on('end', resolve);
+        req.on('error', reject);
+      });
+      const input = JSON.parse(body || '{}');
+      if (!String(input.username || '').trim()) return send(400, { error: 'username (the PPPoE account) is required' });
+      const out = await billingPush(input);
+      return send(out.ok ? 200 : 502, out);
+    } catch (e) {
+      logPush({ username: (() => { try { return JSON.parse(body || '{}').username; } catch (_) { return ''; } })(), ok: false, error: e.message });
+      return send(502, { ok: false, error: e.message });
+    }
+  }
+
+  /* What the pushes did, so a failure with nobody watching is still findable. */
+  if (path === '/api/billing-pushlog') {
+    const send = (code, body) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(body)); };
+    return send(200, { pushes: billingPushLog.slice(-200).reverse() });
+  }
+
   if (path === '/api/naps') {
     const send = (code, body) => {
       res.writeHead(code, { 'Content-Type': 'application/json' });
@@ -1798,7 +2195,7 @@ const server = http.createServer((req, res) => {
 
   res.writeHead(200, { 'Content-Type': 'text/html' });
   res.end(dashboardHtml());
-});
+}
 
 server.listen(DASHBOARD_PORT, () => {
   console.log(`
