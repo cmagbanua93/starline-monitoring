@@ -798,6 +798,18 @@ async function billingPush(input) {
     logPush({ username: input.username, id, ok: true, steps });
     return { ok: true, recordId: id, steps };
   }
+  /* Re-syncing a plan that is already correct is not free: TaokiNinam sends the
+     welcome SMS on this step, so repeating it texts the subscriber again. A
+     ticket that is reopened and completed a second time must not do that. */
+  const already = await billingFindRecord(input.username);
+  if (String(already.products || '').trim().toLowerCase() === product.name.toLowerCase() &&
+      String(already.profile  || '').trim().toLowerCase() === String(product.profile).toLowerCase()) {
+    steps.push({ step: 'plan', status: 'skipped',
+      detail: `already on ${product.name} / ${product.profile} — left alone so the welcome SMS is not sent twice` });
+    logPush({ username: input.username, id, ok: true, steps });
+    return { ok: true, recordId: id, steps };
+  }
+
   const detHtml = await billingGet(`/recordDetails.php?id=${encodeURIComponent(id)}`);
   const svc = parseFormFields(detHtml, 'accountSettings') || {};
   const svcPayload = Object.assign({}, svc, {
