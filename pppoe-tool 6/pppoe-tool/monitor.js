@@ -707,6 +707,42 @@ async function billingCatalog() {
   return data;
 }
 
+/* ---- registering a newly installed NAP box as a billing Area ----
+ *
+ * A box put up in the field does not exist in billing, so the first subscriber
+ * hung off it cannot be filed under it: the area picker has no such entry and
+ * the push refuses to write an area billing does not know. Somebody had to
+ * remember to add it by hand, and when they forgot the failure surfaced hours
+ * later, with the technician long gone from the pole.
+ *
+ * staffArea.php keeps the master list. Adding is a single field, so unlike the
+ * subscriber form there is nothing here to read-modify-write.
+ */
+async function billingAddArea(rawName) {
+  const name = String(rawName == null ? '' : rawName).trim();
+  if (!name) return { ok: false, created: false, error: 'an area needs a name' };
+  if (name.length > 100) return { ok: false, created: false, error: 'that area name is too long to be real' };
+
+  /* Read the live list, not the cache: two NAP jobs finishing together must not
+     both decide the area is missing and add it twice. */
+  const before = parseSelectOptions(await billingGet('/addRecord.php'), 'area')
+    .map(o => o.value).filter(v => v && !/^select /i.test(v));
+  const already = before.find(a => a.toLowerCase() === name.toLowerCase());
+  if (already) return { ok: true, created: false, area: already, note: 'billing already had this area' };
+
+  await billingPost('/actions/addArea.php', { area: name, submit: '' });
+
+  /* Confirm against a fresh read. A 302 back to the page means the form was
+     accepted, not that the row landed, and a silently dropped area would send
+     the next technician round the same loop. */
+  catalogCache = { at: 0, data: null };
+  const after = parseSelectOptions(await billingGet('/addRecord.php'), 'area')
+    .map(o => o.value).filter(v => v && !/^select /i.test(v));
+  const found = after.find(a => a.toLowerCase() === name.toLowerCase());
+  if (!found) return { ok: false, created: false, error: 'billing accepted the form but the area is still not in the list' };
+  return { ok: true, created: true, area: found, areaCount: after.length };
+}
+
 /* ---- the push ----
  * Order is fixed and each step is verified before the next: details, then
  * billing, then the plan. TaokiNinam sends the welcome SMS at the end of that
@@ -2101,6 +2137,33 @@ async function handleRequest(req, res) {
   }
 
   /* What the pushes did, so a failure with nobody watching is still findable. */
+  /* A newly installed NAP box, registered as an Area so subscribers can be
+     filed under it straight away. Idempotent: an area billing already has is
+     reported, not added twice. */
+  if (path === '/api/billing-area') {
+    const send = (code, body) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(body)); };
+    if (req.method !== 'POST') return send(405, { error: 'POST only' });
+    if (!API_TOKEN || !keyMatches(req.headers['x-api-key'] || '')) {
+      return send(401, { error: 'Not authorised' });
+    }
+    if (!BILLING_ENABLED) return send(503, { error: 'Billing is not configured on this service.' });
+    let body = '';
+    try {
+      await new Promise((resolve, reject) => {
+        req.on('data', c => { body += c; if (body.length > 16 * 1024) { req.destroy(); reject(new Error('payload too large')); } });
+        req.on('end', resolve);
+        req.on('error', reject);
+      });
+      const input = JSON.parse(body || '{}');
+      const out = await billingAddArea(input.area);
+      logPush({ area: String(input.area || ''), ok: out.ok, created: !!out.created, error: out.error || '' });
+      return send(out.ok ? 200 : 502, out);
+    } catch (e) {
+      logPush({ area: '', ok: false, error: e.message });
+      return send(502, { ok: false, created: false, error: describeFetchError(e) });
+    }
+  }
+
   if (path === '/api/billing-pushlog') {
     const send = (code, body) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(body)); };
     return send(200, { pushes: billingPushLog.slice(-200).reverse() });
