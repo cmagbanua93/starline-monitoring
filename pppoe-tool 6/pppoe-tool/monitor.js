@@ -101,7 +101,23 @@ const BILLING_BASE_URL = (process.env.TAOKININAM_BASE_URL || 'https://starline.p
 const BILLING_USERNAME = process.env.TAOKININAM_USERNAME;
 const BILLING_PASSWORD = process.env.TAOKININAM_PASSWORD;
 const BILLING_DEBUG    = String(process.env.BILLING_DEBUG || '').toLowerCase() === 'true';
-const BILLING_ENABLED  = Boolean(BILLING_USERNAME && BILLING_PASSWORD);
+/* ---- which billing this monitor talks to ----
+   BILLING_TARGET=taokininam (default) keeps everything exactly as before.
+   BILLING_TARGET=new switches enrichment, the catalogue, area registration and
+   the install push to the StarLine billing app on Railway (REST + API key), so
+   the ticketing app keeps calling this monitor and never needs to change.
+   NEW_BILLING_URL / NEW_BILLING_KEY can be set ahead of time; nothing moves
+   until BILLING_TARGET is flipped on cut-over day. */
+const BILLING_TARGET   = String(process.env.BILLING_TARGET || 'taokininam').trim().toLowerCase();
+const NEW_BILLING_URL  = String(process.env.NEW_BILLING_URL || '').trim().replace(/\/$/, '');
+const NEW_BILLING_KEY  = String(process.env.NEW_BILLING_KEY || '').trim();
+const NEW_BILLING_READY = Boolean(NEW_BILLING_URL && NEW_BILLING_KEY);
+const USE_NEW_BILLING  = BILLING_TARGET === 'new' && NEW_BILLING_READY;
+if (BILLING_TARGET === 'new' && !NEW_BILLING_READY) {
+  console.warn('BILLING_TARGET=new but NEW_BILLING_URL / NEW_BILLING_KEY are missing — staying on TaokiNinam.');
+}
+const OLD_BILLING_ENABLED = Boolean(BILLING_USERNAME && BILLING_PASSWORD);
+const BILLING_ENABLED  = USE_NEW_BILLING || OLD_BILLING_ENABLED;
 
 // ---- service-to-service API ----
 // The ticketing system asks this monitor "who is this customer, and are they
@@ -129,8 +145,41 @@ const ISP_LINKS = [
 ];
 const ISP_PING_TIMEOUT_MS = parseInt(process.env.ISP_PING_TIMEOUT_MS || '2000');
 
-if (!BILLING_ENABLED) {
+if (USE_NEW_BILLING) {
+  console.log(`Billing: StarLine billing app at ${NEW_BILLING_URL}`);
+} else if (!BILLING_ENABLED) {
   console.warn('TAOKININAM_USERNAME / TAOKININAM_PASSWORD not set — running without billing enrichment (customer name/account/contact/area/NAP box will be blank).');
+}
+
+/* ---------- StarLine billing app (BILLING_TARGET=new) ---------- */
+async function newBillingFetch(path, opts = {}) {
+  const res = await fetch(NEW_BILLING_URL + path, {
+    method: opts.method || 'GET',
+    headers: Object.assign({ 'x-api-key': NEW_BILLING_KEY, 'Accept': 'application/json' },
+      opts.body ? { 'Content-Type': 'application/json' } : {}),
+    body: opts.body ? JSON.stringify(opts.body) : undefined,
+    signal: AbortSignal.timeout(opts.timeout || FETCH_TIMEOUT_MS),
+  });
+  const out = await res.json().catch(() => ({}));
+  if (!res.ok && !opts.passThrough) throw new Error(out.error || `billing returned HTTP ${res.status}`);
+  return { status: res.status, ok: res.ok, body: out };
+}
+
+async function newBillingEnrichment() {
+  const { body } = await newBillingFetch('/api/customers');
+  const map = new Map();
+  for (const c of body.customers || []) {
+    const username = String(c.pppoe_username || '').trim();
+    if (!username) continue;
+    map.set(username.toLowerCase(), {
+      accountNo:    String(c.account_no || '').trim(),
+      customerName: [c.first_name, c.last_name].map(v => String(v || '').trim()).filter(Boolean).join(' '),
+      contactNo:    String(c.phone || '').trim(),
+      area:         String(c.area || '').trim(),
+      napBox:       [c.nap, c.nap_port].map(v => String(v || '').trim()).filter(Boolean).join(' / '),
+    });
+  }
+  return map;
 }
 
 // ---------- State ----------
@@ -684,6 +733,12 @@ function logPush(entry) {
 let catalogCache = { at: 0, data: null };
 async function billingCatalog() {
   if (catalogCache.data && Date.now() - catalogCache.at < 10 * 60 * 1000) return catalogCache.data;
+  if (USE_NEW_BILLING) {
+    const { body } = await newBillingFetch('/api/catalog');
+    const data = { areas: body.areas || [], products: (body.products || []).map(p => ({ name: p.name, profile: p.profile, price: String(p.price) })) };
+    catalogCache = { at: Date.now(), data };
+    return data;
+  }
   const [addHtml, prodHtml] = await Promise.all([
     billingGet('/addRecord.php'),
     billingGet('/products.php'),
@@ -719,6 +774,11 @@ async function billingCatalog() {
  * subscriber form there is nothing here to read-modify-write.
  */
 async function billingAddArea(rawName) {
+  if (USE_NEW_BILLING) {
+    const r = await newBillingFetch('/api/areas', { method: 'POST', body: { area: rawName }, passThrough: true });
+    catalogCache = { at: 0, data: null };
+    return r.body && typeof r.body.ok === 'boolean' ? r.body : { ok: false, created: false, error: `billing returned HTTP ${r.status}` };
+  }
   const name = String(rawName == null ? '' : rawName).trim();
   if (!name) return { ok: false, created: false, error: 'an area needs a name' };
   if (name.length > 100) return { ok: false, created: false, error: 'that area name is too long to be real' };
@@ -748,6 +808,13 @@ async function billingAddArea(rawName) {
  * billing, then the plan. TaokiNinam sends the welcome SMS at the end of that
  * chain, so a half-finished record must never reach step three. */
 async function billingPush(input) {
+  if (USE_NEW_BILLING) {
+    const r = await newBillingFetch('/api/installs', { method: 'POST', body: input, passThrough: true, timeout: 60000 });
+    const out = Object.assign({ ok: false, steps: [] }, r.body || {});
+    if (!r.ok && !out.error) out.error = `billing returned HTTP ${r.status}`;
+    logPush({ username: input.username, id: out.recordId, ok: !!out.ok, steps: out.steps, error: out.error || '' });
+    return out;
+  }
   const steps = [];
   const record = await billingFindRecord(input.username);
   const id = record.id;
@@ -871,6 +938,10 @@ async function billingPush(input) {
 
 async function fetchBillingEnrichment() {
   if (!BILLING_ENABLED) return { map: new Map(), error: null };
+  if (USE_NEW_BILLING) {
+    try { return { map: await newBillingEnrichment(), error: null }; }
+    catch (err) { return { map: new Map(), error: describeFetchError(err) }; }
+  }
   try {
     const csvText = await billingFetchCsv();
     const rows = parseCsv(csvText);
@@ -2164,6 +2235,28 @@ async function handleRequest(req, res) {
     }
   }
 
+  /* Cut-over helper: copy every Area TaokiNinam knows into the new billing app.
+     Needs both sets of credentials, so run it before TaokiNinam is switched off.
+     Idempotent — areas the new billing already has are reported, not duplicated. */
+  if (path === '/api/billing-copy-areas') {
+    const send = (code, body) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(body)); };
+    if (req.method !== 'POST') return send(405, { error: 'POST only' });
+    if (!API_TOKEN || !keyMatches(req.headers['x-api-key'] || '')) return send(401, { error: 'Not authorised' });
+    if (!OLD_BILLING_ENABLED || !NEW_BILLING_READY) return send(503, { error: 'Needs TAOKININAM_USERNAME/PASSWORD and NEW_BILLING_URL/NEW_BILLING_KEY.' });
+    try {
+      const addHtml = await billingGet('/addRecord.php');
+      const areas = parseSelectOptions(addHtml, 'area').map(o => o.value).filter(v => v && !/^select /i.test(v));
+      const results = [];
+      for (const a of areas) {
+        const r = await newBillingFetch('/api/areas', { method: 'POST', body: { area: a }, passThrough: true });
+        results.push({ area: a, ok: !!(r.body && r.body.ok), created: !!(r.body && r.body.created) });
+      }
+      return send(200, { found: areas.length, created: results.filter(r => r.created).length, results });
+    } catch (e) {
+      return send(502, { error: describeFetchError(e) });
+    }
+  }
+
   if (path === '/api/billing-pushlog') {
     const send = (code, body) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(body)); };
     return send(200, { pushes: billingPushLog.slice(-200).reverse() });
@@ -2284,7 +2377,7 @@ server.listen(DASHBOARD_PORT, () => {
 ╚══════════════════════════════════════════════╝
 
 Status comes directly from the router (/ppp active, /ppp secret) over SSH.
-Billing enrichment (customer name/account/contact/area/NAP): ${BILLING_ENABLED ? 'ON — ' + BILLING_BASE_URL : 'OFF (TAOKININAM_USERNAME/PASSWORD not set)'}
+Billing enrichment (customer name/account/contact/area/NAP): ${USE_NEW_BILLING ? 'ON — StarLine billing app ' + NEW_BILLING_URL : BILLING_ENABLED ? 'ON — ' + BILLING_BASE_URL : 'OFF (TAOKININAM_USERNAME/PASSWORD not set)'}
 
 Offline time source:
   [SECRET] = the PPP secret's own "last logged out" field (same value
