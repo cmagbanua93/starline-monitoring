@@ -2257,6 +2257,43 @@ async function handleRequest(req, res) {
     }
   }
 
+  /* Repair with a re-used modem: the PPPoE account inside the replacement modem moves to the
+     subscriber being repaired (new billing only). Service key only. */
+  if (path === '/api/billing-modem-swap') {
+    const send = (code, body) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(body)); };
+    if (req.method !== 'POST') return send(405, { error: 'POST only' });
+    if (!API_TOKEN || !keyMatches(req.headers['x-api-key'] || '')) return send(401, { error: 'Not authorised' });
+    if (!USE_NEW_BILLING) return send(503, { ok: false, error: 'Modem swaps are recorded automatically only after the cut-over to the new billing. For now, update the old billing by hand.' });
+    let body = '';
+    try {
+      await new Promise((resolve, reject) => {
+        req.on('data', c => { body += c; if (body.length > 16 * 1024) { req.destroy(); reject(new Error('payload too large')); } });
+        req.on('end', resolve); req.on('error', reject);
+      });
+      const input = JSON.parse(body || '{}');
+      const r = await newBillingFetch('/api/modem-swap', { method: 'POST', body: input, passThrough: true, timeout: 60000 });
+      const out = Object.assign({ ok: false, steps: [] }, r.body || {});
+      logPush({ username: input.newUsername, swapFor: input.customer, ok: !!out.ok, steps: out.steps, error: out.error || '' });
+      return send(out.ok ? 200 : 502, out);
+    } catch (e) {
+      return send(502, { ok: false, error: describeFetchError(e) });
+    }
+  }
+
+  /* Is this PPPoE account free to put in another modem? (new billing only) */
+  if (path.startsWith('/api/billing-pppoe-status/')) {
+    const send = (code, body) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(body)); };
+    if (!API_TOKEN || !keyMatches(req.headers['x-api-key'] || '')) return send(401, { error: 'Not authorised' });
+    if (!USE_NEW_BILLING) return send(200, { state: 'unknown' });
+    try {
+      const u = decodeURIComponent(path.slice('/api/billing-pppoe-status/'.length));
+      const r = await newBillingFetch('/api/pppoe-status/' + encodeURIComponent(u), { passThrough: true });
+      return send(200, r.body || { state: 'unknown' });
+    } catch (e) {
+      return send(200, { state: 'unknown', error: describeFetchError(e) });
+    }
+  }
+
   if (path === '/api/billing-pushlog') {
     const send = (code, body) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(body)); };
     return send(200, { pushes: billingPushLog.slice(-200).reverse() });
