@@ -241,6 +241,36 @@ function stripTags(html) {
 // key="quoted value" ...`, which is much easier to parse reliably than the
 // human-formatted table RouterOS prints by default.
 
+/* Both poll commands over ONE SSH connection: a RouterOS SSH handshake costs more
+   than the commands themselves, and two connections every 30 s added up. */
+async function sshExecMany(commands) {
+  const ssh = new NodeSSH();
+  try {
+    await ssh.connect({
+      host: SSH_HOST, port: SSH_PORT, username: SSH_USER, password: SSH_PASSWORD,
+      readyTimeout: SSH_TIMEOUT_MS,
+      algorithms: {
+        kex: ['diffie-hellman-group14-sha256', 'diffie-hellman-group14-sha1', 'diffie-hellman-group-exchange-sha256', 'diffie-hellman-group1-sha1', 'ecdh-sha2-nistp256'],
+        cipher: ['aes128-ctr', 'aes192-ctr', 'aes256-ctr', 'aes128-cbc', 'aes256-cbc'],
+        serverHostKey: ['ssh-rsa', 'rsa-sha2-256', 'rsa-sha2-512', 'ecdsa-sha2-nistp256', 'ssh-ed25519'],
+        hmac: ['hmac-sha2-256', 'hmac-sha1'],
+      },
+    });
+    const out = [];
+    for (const command of commands) {
+      const result = await ssh.execCommand(command);
+      if (result.code !== 0 && result.stderr) throw new Error(`router returned an error for "${command}": ${result.stderr.trim()}`);
+      out.push(result.stdout);
+    }
+    return out;
+  } catch (err) {
+    if (err && err.level === 'client-timeout') throw new Error(`SSH connection to ${SSH_HOST}:${SSH_PORT} timed out after ${SSH_TIMEOUT_MS}ms`);
+    throw new Error(err && err.message ? err.message : String(err));
+  } finally {
+    ssh.dispose();
+  }
+}
+
 async function sshExec(command) {
   const ssh = new NodeSSH();
   try {
@@ -256,7 +286,7 @@ async function sshExec(command) {
       algorithms: {
         kex: ['diffie-hellman-group14-sha256', 'diffie-hellman-group14-sha1', 'diffie-hellman-group-exchange-sha256', 'diffie-hellman-group1-sha1', 'ecdh-sha2-nistp256'],
         cipher: ['aes128-ctr', 'aes192-ctr', 'aes256-ctr', 'aes128-cbc', 'aes256-cbc'],
-        serverHostKey: ['ssh-rsa', 'rsa-sha2-256', 'rsa-sha2-512', 'ecdsa-sha2-nistp256'],
+        serverHostKey: ['ssh-rsa', 'rsa-sha2-256', 'rsa-sha2-512', 'ecdsa-sha2-nistp256', 'ssh-ed25519'],
         hmac: ['hmac-sha2-256', 'hmac-sha1'],
       },
     });
@@ -936,8 +966,21 @@ async function billingPush(input) {
   return { ok: true, recordId: id, steps };
 }
 
+/* The customer list changes a few times a day, not every 30 s. Downloading the
+   whole billing export on every poll was most of this service's network traffic,
+   so it is fetched at most every BILLING_REFRESH_MINUTES (default 15) and reused
+   in between. A failed fetch keeps the last good copy. */
+const BILLING_REFRESH_MS = Math.max(1, parseInt(process.env.BILLING_REFRESH_MINUTES || '15', 10)) * 60 * 1000;
+let enrichCache = null;          // { map, at }
 async function fetchBillingEnrichment() {
   if (!BILLING_ENABLED) return { map: new Map(), error: null };
+  if (enrichCache && Date.now() - enrichCache.at < BILLING_REFRESH_MS) return { map: enrichCache.map, error: null, cachedAt: enrichCache.at };
+  const fresh = await fetchBillingEnrichmentNow();
+  if (!fresh.error) { enrichCache = { map: fresh.map, at: Date.now() }; return { ...fresh, cachedAt: enrichCache.at }; }
+  if (enrichCache) return { map: enrichCache.map, error: fresh.error, cachedAt: enrichCache.at };
+  return fresh;
+}
+async function fetchBillingEnrichmentNow() {
   if (USE_NEW_BILLING) {
     try { return { map: await newBillingEnrichment(), error: null }; }
     catch (err) { return { map: new Map(), error: describeFetchError(err) }; }
@@ -988,10 +1031,7 @@ async function fetchBillingEnrichment() {
 
 async function pollRouter() {
   try {
-    const [activeOut, secretOut] = await Promise.all([
-      sshExec('/ppp active print terse'),
-      sshExec('/ppp secret print terse'),
-    ]);
+    const [activeOut, secretOut] = await sshExecMany(['/ppp active print terse', '/ppp secret print terse']);
 
     const activeByName = new Map(parseTerse(activeOut).map(r => [r.name, r]));
     const secretRows   = parseTerse(secretOut);
@@ -1103,7 +1143,7 @@ async function pollRouter() {
       alertSince: alertActive ? (state.alertSince || now.toISOString()) : null,
       lastPoll: now.toISOString(),
       pollError: null,
-      billingLastSync: enrichment.error ? state.billingLastSync : (BILLING_ENABLED ? now.toISOString() : null),
+      billingLastSync: enrichment.cachedAt ? new Date(enrichment.cachedAt).toISOString() : (enrichment.error ? state.billingLastSync : (BILLING_ENABLED ? now.toISOString() : null)),
       billingError: enrichment.error,
       billingCustomerCount: enrichment.map.size,
     };
@@ -1117,8 +1157,30 @@ async function pollRouter() {
   }
 }
 
+/* Live dashboard updates. The full state (every account) is sent only when
+   something that matters changed — status, alarms, ISP links, billing — or at
+   least every FULL_PUSH_MINUTES (default 5) so uptimes stay fresh. In between,
+   open dashboards get a tiny "tick" with the poll time. Each open tab used to
+   receive the whole account list twice every 30 s. */
+const FULL_PUSH_MS = Math.max(1, parseInt(process.env.FULL_PUSH_MINUTES || '5', 10)) * 60 * 1000;
+let lastFullKey = '', lastFullAt = 0;
+function significantKey(st) {
+  return JSON.stringify({
+    a: (st.accounts || []).map(a => [a.username, a.status, a.lastLogout, a.flapCount, a.remoteIp, a.profile, a.customerName, a.area, a.napBox]),
+    d: st.downCount, t: st.todayDownCount, al: st.alertActive, pe: st.pollError, be: st.billingError, bc: st.billingCustomerCount,
+    i: (st.isps || []).map(i => [i.name, i.online]),
+  });
+}
 function broadcast() {
-  const payload = `data: ${JSON.stringify(state)}\n\n`;
+  if (!sseClients.size) return;
+  const key = significantKey(state);
+  let payload;
+  if (key !== lastFullKey || Date.now() - lastFullAt >= FULL_PUSH_MS) {
+    payload = `data: ${JSON.stringify(state)}\n\n`;
+    lastFullKey = key; lastFullAt = Date.now();
+  } else {
+    payload = `event: tick\ndata: ${JSON.stringify({ lastPoll: state.lastPoll, pollIntervalSec: state.pollIntervalSec })}\n\n`;
+  }
   for (const client of sseClients) {
     try { client.write(payload); } catch {}
   }
@@ -1641,6 +1703,15 @@ let cdTimer       = null;
 // ---- SSE ----
 const evtSource = new EventSource('/events');
 evtSource.onmessage = e => render(JSON.parse(e.data));
+/* between full updates the server only says "polled at …" */
+evtSource.addEventListener('tick', e => {
+  const t = JSON.parse(e.data);
+  document.getElementById('tb-poll').textContent = fmt(t.lastPoll);
+  clearInterval(cdTimer);
+  let rem = t.pollIntervalSec || 30;
+  document.getElementById('tb-next').textContent = rem;
+  cdTimer = setInterval(() => { rem=Math.max(0,rem-1); document.getElementById('tb-next').textContent=rem; }, 1000);
+});
 evtSource.onerror   = () => {
   document.getElementById('error-bar').textContent = 'Lost connection — is node monitor.js still running?';
   document.getElementById('error-bar').classList.add('active');
