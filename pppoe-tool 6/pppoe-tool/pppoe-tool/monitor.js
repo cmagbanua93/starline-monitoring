@@ -1,0 +1,2500 @@
+/**
+ * monitor.js
+ *
+ * Monitors PPPoE accounts for StarLine Internet.
+ *
+ * Online/offline status and exact "logged out at" timestamps come directly
+ * from the Mikrotik router itself, over SSH — monitor.js runs `/ppp active
+ * print` and `/ppp secret print` on the router's CLI via an SSH connection.
+ * This works from anywhere, including cloud hosts like Railway, as long as
+ * the router's SSH port is reachable — for StarLine that's the remote-access
+ * provider's relayed SSH port (remoteanyx888.jrandombytes.com:26248), the
+ * same port TaokiNinam itself uses to reach the router.
+ *
+ * Customer info (name, account number, contact number, area, NAP box) is
+ * an OPTIONAL enrichment layer sourced from the TaokiNinam billing system
+ * (activesP.php / inactivesP.php), matched onto router accounts by PPPoE
+ * username. If TaokiNinam isn't configured or its fetch fails, monitoring
+ * still works fine — those fields are just left blank. Router status/
+ * timestamps never depend on TaokiNinam being up.
+ *
+ * "Logged out at" times come straight from each PPP secret's own
+ * "last-logged-out" field (the same value Winbox shows under PPP > Secrets
+ * > Last Logged Out) — no log-scraping or guesswork involved. If that field
+ * is ever empty, it falls back to recording the time monitor.js itself
+ * first observed the account go offline. The dashboard tags each time as
+ * SECRET (from the router) or POLL (detected locally) accordingly.
+ *
+ * Also monitors ISP uplinks by pinging their gateway IPs directly from
+ * this machine (edit the ISP_LINKS array below to add/remove/rename links).
+ * Note: this only reflects real uplink status when monitor.js runs on the
+ * same network as those links — running it in the cloud would just test
+ * the cloud host's own connectivity to those IPs.
+ *
+ * MIKROTIK_HOST/PORT/USER/PASSWORD (used by create_pppoe_accounts.js, the
+ * separate bulk provisioner, over the REST API) are NOT used by this file.
+ * This file uses its own MIKROTIK_SSH_* vars, since it talks to the router
+ * over SSH rather than the REST API.
+ *
+ * Usage:
+ *   node monitor.js
+ *   Open http://localhost:3000 in your browser
+ *
+ * .env options:
+ *   MIKROTIK_SSH_HOST=remoteanyx888.jrandombytes.com   (required)
+ *   MIKROTIK_SSH_PORT=26248                            (required)
+ *   MIKROTIK_SSH_USER=admin                            (required) same router admin login
+ *   MIKROTIK_SSH_PASSWORD=yourpassword                 (required)
+ *   TAOKININAM_USERNAME=you@example.com   (optional) enables customer-info enrichment
+ *   TAOKININAM_PASSWORD=yourpassword      (optional)
+ *   TAOKININAM_BASE_URL=https://starline.ph   (optional, this is the default)
+ *   MONITOR_PORT=3000                     (optional; PORT env var wins if set)
+ *   MONITOR_POLL_INTERVAL=30              seconds between polls
+ *   MONITOR_ALERT_THRESHOLD=5             how many offline (since today) triggers the alarm
+ *   BILLING_DEBUG=true                    (optional) verbose TaokiNinam login/fetch logging
+ */
+
+require('dotenv').config();
+const http = require('http');
+const { NodeSSH } = require('node-ssh');
+
+// ---------- Config ----------
+
+// Railway (and most PaaS hosts) inject PORT and require the app to bind to
+// it. Fall back to MONITOR_PORT / 3000 for local runs.
+const DASHBOARD_PORT   = parseInt(process.env.PORT || process.env.MONITOR_PORT || '3000');
+const POLL_INTERVAL_MS = parseInt(process.env.MONITOR_POLL_INTERVAL || '30') * 1000;
+const ALERT_THRESHOLD  = parseInt(process.env.MONITOR_ALERT_THRESHOLD || '5');
+const FETCH_TIMEOUT_MS = parseInt(process.env.MONITOR_FETCH_TIMEOUT_MS || '15000');
+
+// ---- Router SSH connection (primary source — live status + exact log timestamps) ----
+const SSH_HOST     = process.env.MIKROTIK_SSH_HOST;
+const SSH_PORT     = parseInt(process.env.MIKROTIK_SSH_PORT || '22');
+const SSH_USER     = process.env.MIKROTIK_SSH_USER;
+const SSH_PASSWORD = process.env.MIKROTIK_SSH_PASSWORD;
+const SSH_TIMEOUT_MS = parseInt(process.env.MIKROTIK_SSH_TIMEOUT_MS || '15000');
+
+// The router prints its own local time (whatever /system clock time-zone is
+// set to on the router — Philippines/Manila = UTC+8), regardless of what
+// timezone the machine running monitor.js is in. Running locally in the
+// Philippines, that happened to match by coincidence; running on a cloud
+// host like Railway (usually UTC), it silently doesn't. This offset lets
+// us convert the router's wall-clock reading to the correct UTC instant
+// instead of misreading it as the server's own local time.
+function parseTzOffsetToMinutes(raw) {
+  const m = String(raw || '').trim().match(/^([+-])(\d{1,2}):?(\d{2})?$/);
+  if (!m) return 8 * 60; // default: Philippines (UTC+8)
+  const sign = m[1] === '-' ? -1 : 1;
+  return sign * (parseInt(m[2], 10) * 60 + (m[3] ? parseInt(m[3], 10) : 0));
+}
+const MIKROTIK_TZ_OFFSET_MIN = parseTzOffsetToMinutes(process.env.MIKROTIK_TZ_OFFSET || '+08:00');
+
+if (!SSH_HOST || !SSH_USER || !SSH_PASSWORD) {
+  console.error('Missing MIKROTIK_SSH_HOST, MIKROTIK_SSH_USER or MIKROTIK_SSH_PASSWORD in .env — these are required (monitor.js talks to the router over SSH).');
+  process.exit(1);
+}
+
+// ---- TaokiNinam billing system (OPTIONAL — customer-info enrichment only) ----
+// If unset, monitoring still works fully via SSH; customer name/account/
+// contact/area/NAP box just stay blank.
+const BILLING_BASE_URL = (process.env.TAOKININAM_BASE_URL || 'https://starline.ph').replace(/\/$/, '');
+const BILLING_USERNAME = process.env.TAOKININAM_USERNAME;
+const BILLING_PASSWORD = process.env.TAOKININAM_PASSWORD;
+const BILLING_DEBUG    = String(process.env.BILLING_DEBUG || '').toLowerCase() === 'true';
+/* ---- which billing this monitor talks to ----
+   BILLING_TARGET=taokininam (default) keeps everything exactly as before.
+   BILLING_TARGET=new switches enrichment, the catalogue, area registration and
+   the install push to the StarLine billing app on Railway (REST + API key), so
+   the ticketing app keeps calling this monitor and never needs to change.
+   NEW_BILLING_URL / NEW_BILLING_KEY can be set ahead of time; nothing moves
+   until BILLING_TARGET is flipped on cut-over day. */
+const BILLING_TARGET   = String(process.env.BILLING_TARGET || 'taokininam').trim().toLowerCase();
+const NEW_BILLING_URL  = String(process.env.NEW_BILLING_URL || '').trim().replace(/\/$/, '');
+const NEW_BILLING_KEY  = String(process.env.NEW_BILLING_KEY || '').trim();
+const NEW_BILLING_READY = Boolean(NEW_BILLING_URL && NEW_BILLING_KEY);
+const USE_NEW_BILLING  = BILLING_TARGET === 'new' && NEW_BILLING_READY;
+if (BILLING_TARGET === 'new' && !NEW_BILLING_READY) {
+  console.warn('BILLING_TARGET=new but NEW_BILLING_URL / NEW_BILLING_KEY are missing — staying on TaokiNinam.');
+}
+const OLD_BILLING_ENABLED = Boolean(BILLING_USERNAME && BILLING_PASSWORD);
+const BILLING_ENABLED  = USE_NEW_BILLING || OLD_BILLING_ENABLED;
+
+// ---- service-to-service API ----
+// The ticketing system asks this monitor "who is this customer, and are they
+// (and their neighbours on the same NAP) online?". That answer carries customer
+// contact details, so /api/customers is closed unless a shared key is set.
+const API_TOKEN = process.env.API_TOKEN || '';
+
+// ---- dashboard sign-in ----
+// The dashboard and its data feed carry every subscriber's name, account number
+// and contact number, so they are closed to anyone without the password. A
+// browser cannot set headers on an EventSource, so the browser gets a signed
+// cookie; services keep using X-Api-Key.
+const DASHBOARD_PASSWORD = process.env.DASHBOARD_PASSWORD || '';
+const SESSION_SECRET = process.env.SESSION_SECRET ||
+  require('crypto').randomBytes(24).toString('hex');
+
+// ---- ISP uplink monitoring (pings each gateway IP directly from this machine) ----
+// Edit this list to add/remove/rename ISP links.
+const ISP_LINKS = [
+  { name: 'Globe 1Gbps',        ip: '222.127.255.192', plan: '1Gbps'   },
+  { name: 'Globe Biz+ 500Mbps', ip: '180.191.137.7',    plan: '500Mbps' },
+  { name: 'Globe Biz 500Mbps',  ip: '180.191.229.3',    plan: '500Mbps' },
+  { name: 'PLDT 500Mbps',       ip: '115.147.14.124',   plan: '500Mbps' },
+  { name: 'PLDT SME - 500 Mbps', ip: '122.3.130.109',   plan: '500Mbps' },
+];
+const ISP_PING_TIMEOUT_MS = parseInt(process.env.ISP_PING_TIMEOUT_MS || '2000');
+
+if (USE_NEW_BILLING) {
+  console.log(`Billing: StarLine billing app at ${NEW_BILLING_URL}`);
+} else if (!BILLING_ENABLED) {
+  console.warn('TAOKININAM_USERNAME / TAOKININAM_PASSWORD not set — running without billing enrichment (customer name/account/contact/area/NAP box will be blank).');
+}
+
+/* ---------- StarLine billing app (BILLING_TARGET=new) ---------- */
+async function newBillingFetch(path, opts = {}) {
+  const res = await fetch(NEW_BILLING_URL + path, {
+    method: opts.method || 'GET',
+    headers: Object.assign({ 'x-api-key': NEW_BILLING_KEY, 'Accept': 'application/json' },
+      opts.body ? { 'Content-Type': 'application/json' } : {}),
+    body: opts.body ? JSON.stringify(opts.body) : undefined,
+    signal: AbortSignal.timeout(opts.timeout || FETCH_TIMEOUT_MS),
+  });
+  const out = await res.json().catch(() => ({}));
+  if (!res.ok && !opts.passThrough) throw new Error(out.error || `billing returned HTTP ${res.status}`);
+  return { status: res.status, ok: res.ok, body: out };
+}
+
+async function newBillingEnrichment() {
+  const { body } = await newBillingFetch('/api/customers');
+  const map = new Map();
+  for (const c of body.customers || []) {
+    const username = String(c.pppoe_username || '').trim();
+    if (!username) continue;
+    map.set(username.toLowerCase(), {
+      accountNo:    String(c.account_no || '').trim(),
+      customerName: [c.first_name, c.last_name].map(v => String(v || '').trim()).filter(Boolean).join(' '),
+      contactNo:    String(c.phone || '').trim(),
+      area:         String(c.area || '').trim(),
+      napBox:       [c.nap, c.nap_port].map(v => String(v || '').trim()).filter(Boolean).join(' / '),
+    });
+  }
+  return map;
+}
+
+// ---------- State ----------
+
+const MONITOR_STARTED_AT = new Date().toISOString();
+
+let state = {
+  accounts: [],
+  downCount: 0,
+  totalCount: 0,
+  alertActive: false,
+  alertSince: null,
+  lastPoll: null,
+  pollError: null,
+  routerHost: `${SSH_HOST}:${SSH_PORT} (SSH)`,
+  pollIntervalSec: Math.round(POLL_INTERVAL_MS / 1000),
+  alertThreshold: ALERT_THRESHOLD,
+  billingEnabled: BILLING_ENABLED,
+  billingLastSync: null,
+  billingError: null,
+  billingCustomerCount: 0,
+  isps: ISP_LINKS.map(isp => ({ ...isp, online: null, latencyMs: null })),
+  ispsLastCheck: null,
+  monitorStartedAt: MONITOR_STARTED_AT,
+};
+
+const sseClients = new Set();
+
+// ---------- Shared fetch helpers ----------
+
+// Node's fetch collapses DNS failures, connection refused, TLS errors, and
+// timeouts into one generic "fetch failed" message. Surface the real reason
+// (from err.cause) so poll errors are actually actionable.
+function describeFetchError(err) {
+  const cause = err && err.cause;
+  if (err && err.name === 'TimeoutError') return `timed out after ${FETCH_TIMEOUT_MS}ms connecting to ${BILLING_BASE_URL}`;
+  if (cause && cause.code) return `${err.message} — ${cause.code}${cause.message ? ': ' + cause.message : ''}`;
+  if (cause && cause.message) return `${err.message} — ${cause.message}`;
+  return err ? err.message : String(err);
+}
+
+function stripTags(html) {
+  return String(html || '')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/?[^>]+>/g, '')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .trim();
+}
+
+// ---------- Router SSH client ----------
+//
+// Runs RouterOS CLI commands over SSH (the same relayed port TaokiNinam
+// itself uses: remoteanyx888.jrandombytes.com:26248). RouterOS supports
+// running a single command non-interactively over SSH exec, same as
+// `ssh user@host '/ppp active print'` from a terminal.
+//
+// `print terse` output puts one record per line as `<index> key=value
+// key="quoted value" ...`, which is much easier to parse reliably than the
+// human-formatted table RouterOS prints by default.
+
+/* Both poll commands over ONE SSH connection: a RouterOS SSH handshake costs more
+   than the commands themselves, and two connections every 30 s added up. */
+async function sshExecMany(commands) {
+  const ssh = new NodeSSH();
+  try {
+    await ssh.connect({
+      host: SSH_HOST, port: SSH_PORT, username: SSH_USER, password: SSH_PASSWORD,
+      readyTimeout: SSH_TIMEOUT_MS,
+      algorithms: {
+        kex: ['diffie-hellman-group14-sha256', 'diffie-hellman-group14-sha1', 'diffie-hellman-group-exchange-sha256', 'diffie-hellman-group1-sha1', 'ecdh-sha2-nistp256'],
+        cipher: ['aes128-ctr', 'aes192-ctr', 'aes256-ctr', 'aes128-cbc', 'aes256-cbc'],
+        serverHostKey: ['ssh-rsa', 'rsa-sha2-256', 'rsa-sha2-512', 'ecdsa-sha2-nistp256', 'ssh-ed25519'],
+        hmac: ['hmac-sha2-256', 'hmac-sha1'],
+      },
+    });
+    const out = [];
+    for (const command of commands) {
+      const result = await ssh.execCommand(command);
+      if (result.code !== 0 && result.stderr) throw new Error(`router returned an error for "${command}": ${result.stderr.trim()}`);
+      out.push(result.stdout);
+    }
+    return out;
+  } catch (err) {
+    if (err && err.level === 'client-timeout') throw new Error(`SSH connection to ${SSH_HOST}:${SSH_PORT} timed out after ${SSH_TIMEOUT_MS}ms`);
+    throw new Error(err && err.message ? err.message : String(err));
+  } finally {
+    ssh.dispose();
+  }
+}
+
+async function sshExec(command) {
+  const ssh = new NodeSSH();
+  try {
+    await ssh.connect({
+      host: SSH_HOST,
+      port: SSH_PORT,
+      username: SSH_USER,
+      password: SSH_PASSWORD,
+      readyTimeout: SSH_TIMEOUT_MS,
+      // RouterOS (especially older RouterOS 6.x) may only offer algorithms
+      // that newer ssh2 defaults don't include — widen the accepted set so
+      // the handshake doesn't fail on an otherwise-reachable router.
+      algorithms: {
+        kex: ['diffie-hellman-group14-sha256', 'diffie-hellman-group14-sha1', 'diffie-hellman-group-exchange-sha256', 'diffie-hellman-group1-sha1', 'ecdh-sha2-nistp256'],
+        cipher: ['aes128-ctr', 'aes192-ctr', 'aes256-ctr', 'aes128-cbc', 'aes256-cbc'],
+        serverHostKey: ['ssh-rsa', 'rsa-sha2-256', 'rsa-sha2-512', 'ecdsa-sha2-nistp256', 'ssh-ed25519'],
+        hmac: ['hmac-sha2-256', 'hmac-sha1'],
+      },
+    });
+    const result = await ssh.execCommand(command);
+    if (result.code !== 0 && result.stderr) {
+      throw new Error(`router returned an error for "${command}": ${result.stderr.trim()}`);
+    }
+    return result.stdout;
+  } catch (err) {
+    if (err && err.level === 'client-timeout') throw new Error(`SSH connection to ${SSH_HOST}:${SSH_PORT} timed out after ${SSH_TIMEOUT_MS}ms`);
+    throw new Error(err && err.message ? err.message : String(err));
+  } finally {
+    ssh.dispose();
+  }
+}
+
+// Parses RouterOS "print terse" output into an array of field objects.
+// Each line looks like:  0   name="user1" service=pppoe address=10.0.0.5 uptime=1h2m3s
+function parseTerse(output) {
+  const rows = [];
+  const lines = String(output || '').split('\n');
+  for (const rawLine of lines) {
+    let line = rawLine.trim();
+    if (!line || !/^\d+\s/.test(line)) continue; // skip blank lines / anything not starting with a record index
+    // RouterOS emits date/time fields unquoted but with an embedded space
+    // (e.g. `time=jul/12/2026 09:10:00` or `last-logged-out=jul/12/2026
+    // 09:10:00`), which breaks the generic key=value split below —
+    // normalize any such field to a quoted value first so it parses as
+    // one field instead of two.
+    line = line.replace(/([\w-]+)=([a-z]{3}\/\d{1,2}\/\d{4}) (\d{2}:\d{2}:\d{2})/gi, '$1="$2 $3"');
+    line = line.replace(/([\w-]+)=(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2})/g, '$1="$2 $3"');
+    const fields = {};
+    const fieldRe = /(\S+?)=("(?:[^"\\]|\\.)*"|\S*)/g;
+    let m;
+    while ((m = fieldRe.exec(line))) {
+      let val = m[2];
+      if (val.startsWith('"') && val.endsWith('"')) val = val.slice(1, -1).replace(/\\"/g, '"');
+      fields[m[1]] = val;
+    }
+    if (Object.keys(fields).length) rows.push(fields);
+  }
+  return rows;
+}
+
+// ---------- TaokiNinam billing system (optional customer-info enrichment) ----------
+//
+// TaokiNinam is a classic PHP session-cookie app:
+//   1. POST cusername/cpassword to /actions/login_check.php -> PHPSESSID cookie
+//   2. GET /actions/exportRecords.php (with that cookie) -> full customer CSV
+// The CSV's USERNAME column is the same PPPoE secret name used on the
+// router, so it's the join key against the SSH-sourced account list.
+//
+// Used here only to enrich router-sourced accounts with customer name,
+// account number, contact number, area, and NAP box — matched onto the
+// router's PPPoE username. If this fails or isn't configured, monitoring
+// still works fully via SSH; these fields are just left blank.
+
+let billingCookie = null;
+
+async function billingLogin() {
+  const loginUrl = `${BILLING_BASE_URL}/actions/login_check.php`;
+  if (BILLING_DEBUG) console.log(`[billing debug] BILLING_BASE_URL = ${JSON.stringify(BILLING_BASE_URL)} | POST ${loginUrl}`);
+
+  const res = await fetch(loginUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'User-Agent': 'Mozilla/5.0 (compatible; monitor.js)',
+    },
+    body: new URLSearchParams({ cusername: BILLING_USERNAME, cpassword: BILLING_PASSWORD, submit: '' }).toString(),
+    redirect: 'manual',
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+  });
+
+  const setCookies = typeof res.headers.getSetCookie === 'function'
+    ? res.headers.getSetCookie()
+    : (res.headers.get('set-cookie') ? [res.headers.get('set-cookie')] : []);
+
+  if (BILLING_DEBUG) {
+    console.log(`[billing debug] login_check.php -> status ${res.status}, location: ${res.headers.get('location') || '(none)'}, set-cookie count: ${setCookies.length}`);
+  }
+
+  const sessionCookie = setCookies.map(c => c.split(';')[0]).find(c => c.startsWith('PHPSESSID='));
+  if (!sessionCookie) {
+    if (BILLING_DEBUG) {
+      const bodySnippet = (await res.text().catch(() => '')).slice(0, 300);
+      console.log(`[billing debug] login response body (first 300 chars): ${bodySnippet}`);
+    }
+    throw new Error('billing login failed — no PHPSESSID returned (check TAOKININAM_USERNAME/PASSWORD, or set BILLING_DEBUG=true in .env for more detail)');
+  }
+
+  billingCookie = sessionCookie;
+}
+
+async function billingFetchCsv() {
+  if (!billingCookie) await billingLogin();
+
+  const exportUrl = `${BILLING_BASE_URL}/actions/exportRecords.php`;
+  if (BILLING_DEBUG) console.log(`[billing debug] GET ${exportUrl} | cookie: ${billingCookie ? billingCookie.split('=')[0] : '(none)'}=***`);
+
+  const doFetch = () => fetch(exportUrl, {
+    headers: {
+      Cookie: billingCookie,
+      'User-Agent': 'Mozilla/5.0 (compatible; monitor.js)',
+    },
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+  });
+
+  let res, text;
+  try {
+    res = await doFetch();
+    text = await res.text();
+  } catch (err) {
+    throw new Error(describeFetchError(err));
+  }
+
+  // Session expired / not logged in -> exportRecords.php won't return CSV.
+  // Re-login once and retry.
+  if (!text.trimStart().startsWith('ID,ACCOUNT')) {
+    if (BILLING_DEBUG) console.log(`[billing debug] exportRecords.php -> status ${res.status}, first 200 chars: ${text.slice(0, 200)}`);
+    await billingLogin();
+    try {
+      res = await doFetch();
+      text = await res.text();
+    } catch (err) {
+      throw new Error(describeFetchError(err));
+    }
+    if (!text.trimStart().startsWith('ID,ACCOUNT')) {
+      if (BILLING_DEBUG) console.log(`[billing debug] retry exportRecords.php -> status ${res.status}, first 200 chars: ${text.slice(0, 200)}`);
+      throw new Error('billing export did not return CSV — login may have failed (set BILLING_DEBUG=true in .env for more detail)');
+    }
+  }
+
+  return text;
+}
+
+// Minimal RFC4180 CSV parser — handles quoted fields, escaped quotes ("")
+// and embedded newlines inside quoted fields (TaokiNinam's export uses these).
+function parseCsv(text) {
+  const rows = [];
+  let row = [], field = '', inQuotes = false;
+
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (text[i + 1] === '"') { field += '"'; i++; }
+        else { inQuotes = false; }
+      } else {
+        field += c;
+      }
+    } else if (c === '"') {
+      inQuotes = true;
+    } else if (c === ',') {
+      row.push(field); field = '';
+    } else if (c === '\r') {
+      // skip
+    } else if (c === '\n') {
+      row.push(field); rows.push(row); row = []; field = '';
+    } else {
+      field += c;
+    }
+  }
+  if (field.length || row.length) { row.push(field); rows.push(row); }
+  return rows;
+}
+
+// ---------- ISP uplink monitoring ----------
+// Pings each ISP gateway IP directly from this machine (shells out to the OS
+// ping command — works cross-platform without needing raw-socket permissions).
+
+// ICMP ping needs a raw socket, which most containerized hosts (Railway
+// included) don't grant — child_process.exec('ping ...') just fails there
+// regardless of whether the target is actually reachable, which is why
+// every ISP link used to show offline once this ran in the cloud. A plain
+// TCP connect attempt needs no special privileges: a real connection, or
+// even an immediate "connection refused" (a TCP RST — the host is there,
+// it just isn't listening on that exact port), both prove the host
+// answered. Only a timeout counts as unreachable. Tries a few common
+// ports since we don't know what's actually listening on these gateways.
+function pingHost(ip, timeoutMs = ISP_PING_TIMEOUT_MS) {
+  const net = require('net');
+  const PORTS = [443, 80, 53, 22];
+
+  return new Promise((resolve) => {
+    const start = Date.now();
+    let i = 0;
+
+    function tryNextPort() {
+      if (i >= PORTS.length) { resolve({ online: false, latencyMs: null }); return; }
+      const port = PORTS[i++];
+      const socket = new net.Socket();
+      let settled = false;
+
+      const finish = (online) => {
+        if (settled) return;
+        settled = true;
+        socket.destroy();
+        if (online) resolve({ online: true, latencyMs: Date.now() - start });
+        else tryNextPort();
+      };
+
+      socket.setTimeout(timeoutMs);
+      socket.once('connect', () => finish(true));
+      socket.once('error', (err) => finish(err && err.code === 'ECONNREFUSED'));
+      socket.once('timeout', () => finish(false));
+      socket.connect(port, ip);
+    }
+
+    tryNextPort();
+  });
+}
+
+async function pollIsps() {
+  const results = await Promise.all(ISP_LINKS.map(async isp => {
+    const r = await pingHost(isp.ip);
+    return { ...isp, online: r.online, latencyMs: r.latencyMs };
+  }));
+  state = { ...state, isps: results, ispsLastCheck: new Date().toISOString() };
+  broadcast();
+}
+
+// ---------- Poll (router via SSH; TaokiNinam only enriches customer fields) ----------
+
+const MONTH_ABBR = { jan:0, feb:1, mar:2, apr:3, may:4, jun:5, jul:6, aug:7, sep:8, oct:9, nov:10, dec:11 };
+
+// RouterOS renders date/time fields in a couple of formats depending on
+// context: "YYYY-MM-DD HH:MM:SS", "mon/dd/yyyy HH:MM:SS", or just
+// "HH:MM:SS" for something that happened earlier today.
+// Converts router-local wall-clock components (Y, M[0-idx], D, h, m, s) to
+// the correct UTC instant, using MIKROTIK_TZ_OFFSET_MIN — NOT new Date(y,m,
+// d,h,mi,s), which silently uses the server process's own local timezone.
+function routerLocalToUtc(year, month, day, hour, min, sec) {
+  return new Date(Date.UTC(year, month, day, hour, min, sec) - MIKROTIK_TZ_OFFSET_MIN * 60000);
+}
+
+// Returns "today" as the router's clock would see it (its configured
+// timezone may differ from the server's), for the short "HH:MM:SS" form.
+function todayInRouterTz() {
+  const shifted = new Date(Date.now() + MIKROTIK_TZ_OFFSET_MIN * 60000);
+  return { year: shifted.getUTCFullYear(), month: shifted.getUTCMonth(), day: shifted.getUTCDate() };
+}
+
+function parseRouterOsTime(raw) {
+  if (!raw) return null;
+  const iso = raw.match(/^(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2}):(\d{2})$/);
+  if (iso) return routerLocalToUtc(+iso[1], +iso[2] - 1, +iso[3], +iso[4], +iso[5], +iso[6]);
+  const todayOnly = raw.match(/^(\d{2}):(\d{2}):(\d{2})$/);
+  if (todayOnly) {
+    const { year, month, day } = todayInRouterTz();
+    return routerLocalToUtc(year, month, day, +todayOnly[1], +todayOnly[2], +todayOnly[3]);
+  }
+  const full = raw.match(/^([a-z]{3})\/(\d{1,2})\/(\d{4})\s+(\d{2}):(\d{2}):(\d{2})$/i);
+  if (full) {
+    const month = MONTH_ABBR[full[1].toLowerCase()];
+    if (month === undefined) return null;
+    return routerLocalToUtc(+full[3], month, +full[2], +full[4], +full[5], +full[6]);
+  }
+  return null;
+}
+
+// RouterOS reports session uptime as a compact duration string on each
+// active connection — e.g. "1w2d3h4m5s", "2h34m1s", "10m2s", "45s".
+// Converted to seconds so the column can be sorted numerically; the raw
+// string is kept for display since it's already human-readable.
+function parseRouterOsUptime(raw) {
+  if (!raw) return null;
+  const m = String(raw).match(/^(?:(\d+)w)?(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$/);
+  if (!m || !m.slice(1).some(Boolean)) return null;
+  const [w, d, h, min, s] = m.slice(1).map(v => parseInt(v || '0', 10));
+  return w * 604800 + d * 86400 + h * 3600 + min * 60 + s;
+}
+
+// Fetches TaokiNinam's customer CSV export purely for enrichment. Never
+// throws — a failure here just means blank customer fields, since router
+// status/timestamps don't depend on it. Keyed by lowercased username so
+// the join with the router's PPPoE secret name is case-insensitive.
+/* ---------- writing back to TaokiNinam ----------
+ *
+ * Reading the billing export is safe; writing to it is not. Three things about
+ * this app shape everything below:
+ *
+ *  1. editRecords.php posts EVERY field on the form. Sending only the fields we
+ *     care about blanks the rest — email, credit limit, the external URLs — so a
+ *     write is always read-modify-write against the live form.
+ *  2. The three steps are a chain, not a set. TaokiNinam sends the subscriber a
+ *     welcome SMS once details are complete, billing is active and a plan is
+ *     chosen. If step 1 half-succeeds and step 3 still runs, a real customer is
+ *     texted about an account that was never filled in properly. So each step
+ *     verifies before the next one starts, and a failure stops the chain.
+ *  3. Nobody is reviewing these. Every push is logged, and anything already done
+ *     is skipped rather than repeated.
+ */
+
+/* A GET that survives an expired PHP session. */
+async function billingGet(path) {
+  if (!billingCookie) await billingLogin();
+  const url = BILLING_BASE_URL + path;
+  const once = () => fetch(url, {
+    headers: { Cookie: billingCookie, 'User-Agent': 'Mozilla/5.0 (compatible; monitor.js)' },
+    redirect: 'manual',
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+  });
+  let res = await once();
+  if (res.status === 302 || res.status === 301) { await billingLogin(); res = await once(); }
+  const text = await res.text();
+  if (/name=["']cpassword["']/.test(text)) {          // bounced to the login form
+    await billingLogin();
+    res = await once();
+    return res.text();
+  }
+  return text;
+}
+
+async function billingPost(path, params) {
+  if (!billingCookie) await billingLogin();
+  const url = BILLING_BASE_URL + path;
+  const body = new URLSearchParams(params).toString();
+  const once = () => fetch(url, {
+    method: 'POST',
+    headers: {
+      Cookie: billingCookie,
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'User-Agent': 'Mozilla/5.0 (compatible; monitor.js)',
+    },
+    body,
+    redirect: 'manual',
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+  });
+  let res = await once();
+  if (res.status === 401 || res.status === 403) { await billingLogin(); res = await once(); }
+  return { status: res.status, location: res.headers.get('location') || '' };
+}
+
+/* Reads the current values out of a rendered TaokiNinam form so a write can put
+   them back unchanged. Deliberately tolerant: attributes appear in any order and
+   the markup is hand-written PHP. */
+function parseFormFields(html, actionMatch) {
+  const forms = [];
+  const re = /<form\b([^>]*)>([\s\S]*?)<\/form>/gi;
+  let m;
+  while ((m = re.exec(html))) forms.push({ attrs: m[1], inner: m[2] });
+  const form = forms.find(f => new RegExp('action\\s*=\\s*["\'][^"\']*' + actionMatch, 'i').test(f.attrs));
+  if (!form) return null;
+
+  const attr = (tag, name) => {
+    const r = new RegExp(name + '\\s*=\\s*("([^"]*)"|\'([^\']*)\'|([^\\s>]+))', 'i').exec(tag);
+    if (!r) return null;
+    return r[2] !== undefined ? r[2] : r[3] !== undefined ? r[3] : r[4];
+  };
+  const unescape = (v) => String(v == null ? '' : v)
+    .replace(/&quot;/g, '"').replace(/&#0?39;/g, "'").replace(/&apos;/g, "'")
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+
+  const out = {};
+  /* inputs — radios and checkboxes only count when checked, exactly as a browser
+     would submit them */
+  const inputRe = /<input\b[^>]*>/gi;
+  let t;
+  while ((t = inputRe.exec(form.inner))) {
+    const tag = t[0];
+    const name = attr(tag, 'name');
+    if (!name) continue;
+    const type = (attr(tag, 'type') || 'text').toLowerCase();
+    if (type === 'submit' || type === 'button' || type === 'file' || type === 'reset') continue;
+    if (type === 'radio' || type === 'checkbox') {
+      if (/\schecked\b/i.test(tag)) out[name] = unescape(attr(tag, 'value') || 'on');
+      else if (!(name in out)) out[name] = out[name] || '';
+      continue;
+    }
+    out[name] = unescape(attr(tag, 'value') || '');
+  }
+  /* selects — the selected option, or the first one, as a browser would */
+  const selRe = /<select\b([^>]*)>([\s\S]*?)<\/select>/gi;
+  while ((t = selRe.exec(form.inner))) {
+    const name = attr(t[1], 'name');
+    if (!name) continue;
+    const opts = [];
+    const optRe = /<option\b([^>]*)>([\s\S]*?)<\/option>/gi;
+    let o;
+    while ((o = optRe.exec(t[2]))) {
+      const val = attr(o[1], 'value');
+      opts.push({ value: unescape(val === null ? o[2].trim() : val), selected: /\sselected\b/i.test(o[1]) });
+    }
+    const chosen = opts.find(x => x.selected) || opts[0];
+    out[name] = chosen ? chosen.value : '';
+  }
+  /* textareas */
+  const taRe = /<textarea\b([^>]*)>([\s\S]*?)<\/textarea>/gi;
+  while ((t = taRe.exec(form.inner))) {
+    const name = attr(t[1], 'name');
+    if (name) out[name] = unescape(t[2]);
+  }
+  return out;
+}
+
+/* The options a select will actually accept — used to refuse an area or plan
+   TaokiNinam does not know, rather than silently writing a blank. */
+function parseSelectOptions(html, selectName) {
+  const re = new RegExp('<select\\b[^>]*name\\s*=\\s*["\']' + selectName + '["\'][^>]*>([\\s\\S]*?)<\\/select>', 'i');
+  const m = re.exec(html);
+  if (!m) return [];
+  const out = [];
+  const optRe = /<option\b([^>]*)>([\s\S]*?)<\/option>/gi;
+  let o;
+  while ((o = optRe.exec(m[1]))) {
+    const vm = /value\s*=\s*"([^"]*)"/i.exec(o[1]);
+    const text = o[2].replace(/<[^>]*>/g, '').trim();
+    const value = vm ? vm[1] : text;
+    if (value) out.push({ value, text });
+  }
+  return out;
+}
+
+/* The billing record for a PPPoE username, straight from the export, including
+   its internal id and enough current state to know what still needs doing. */
+async function billingFindRecord(username) {
+  const want = String(username || '').trim().toLowerCase();
+  if (!want) throw new Error('no PPPoE username supplied');
+  const rows = parseCsv(await billingFetchCsv());
+  if (!rows.length) throw new Error('billing export returned no rows');
+  const header = rows[0];
+  const idx = name => header.indexOf(name);
+  const iUser = idx('USERNAME');
+  if (iUser === -1) throw new Error('billing export has no USERNAME column');
+
+  const hits = [];
+  for (let r = 1; r < rows.length; r++) {
+    if ((rows[r][iUser] || '').trim().toLowerCase() === want) hits.push(rows[r]);
+  }
+  if (!hits.length) throw new Error(`no billing record has the PPPoE username "${username}"`);
+  if (hits.length > 1) throw new Error(`${hits.length} billing records share the PPPoE username "${username}" — refusing to guess which one to update`);
+
+  const row = hits[0];
+  const get = n => (idx(n) === -1 ? '' : (row[idx(n)] || '').trim());
+  return {
+    id: get('ID'), account: get('ACCOUNT'),
+    fname: get('FNAME'), lname: get('LNAME'), area: get('AREA'),
+    username: get('USERNAME'), password: get('PASSWORD'),
+    billing: get('BILLING'), products: get('PRODUCTS'), profile: get('PROFILE'),
+    dueDate: get('DUEDATE'), billDate: get('BILLDATE'),
+    nap: get('NAP'), port: get('PORT'), phone: get('PHONE'),
+  };
+}
+
+/* Due date = installation date + one calendar month. Overshoot is clamped to the
+   last day of the target month, so a 31 Jan install lands on 28/29 Feb rather
+   than skipping into March. */
+function addOneMonth(isoDate) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(isoDate || ''));
+  if (!m) return '';
+  const y = +m[1], mo = +m[2], d = +m[3];
+  const targetY = mo === 12 ? y + 1 : y;
+  const targetM = mo === 12 ? 1 : mo + 1;
+  const lastDay = new Date(Date.UTC(targetY, targetM, 0)).getUTCDate();
+  const day = Math.min(d, lastDay);
+  return `${targetY}-${String(targetM).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+}
+
+/* Billing counts as already switched on if TaokiNinam reports a billing type. */
+function billingIsActive(rec) {
+  const v = String(rec.billing || '').trim().toLowerCase();
+  return v !== '' && v !== '0' && v !== 'inactive' && v !== 'none';
+}
+
+const billingPushLog = [];
+function logPush(entry) {
+  billingPushLog.push(Object.assign({ ts: new Date().toISOString() }, entry));
+  if (billingPushLog.length > 500) billingPushLog.splice(0, billingPushLog.length - 500);
+}
+
+/* The catalogues TaokiNinam owns. Read live so adding a plan or an area in
+   billing needs no change here or in the ticketing app. */
+let catalogCache = { at: 0, data: null };
+async function billingCatalog() {
+  if (catalogCache.data && Date.now() - catalogCache.at < 10 * 60 * 1000) return catalogCache.data;
+  if (USE_NEW_BILLING) {
+    const { body } = await newBillingFetch('/api/catalog');
+    const data = { areas: body.areas || [], products: (body.products || []).map(p => ({ name: p.name, profile: p.profile, price: String(p.price) })) };
+    catalogCache = { at: Date.now(), data };
+    return data;
+  }
+  const [addHtml, prodHtml] = await Promise.all([
+    billingGet('/addRecord.php'),
+    billingGet('/products.php'),
+  ]);
+  const areas = parseSelectOptions(addHtml, 'area').map(o => o.value).filter(v => v && !/^select /i.test(v));
+  /* products.php renders one row per plan: id, name, profile group, type, price */
+  const products = [];
+  const rowRe = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
+  let r;
+  while ((r = rowRe.exec(prodHtml))) {
+    const cells = [];
+    const cRe = /<td[^>]*>([\s\S]*?)<\/td>/gi;
+    let c;
+    while ((c = cRe.exec(r[1]))) cells.push(c[1].replace(/<[^>]*>/g, '').replace(/&amp;/g, '&').trim());
+    if (cells.length >= 5 && cells[1] && cells[2] && /^\d+$/.test(cells[0])) {
+      products.push({ name: cells[1], profile: cells[2], price: cells[4] });
+    }
+  }
+  const data = { areas, products };
+  catalogCache = { at: Date.now(), data };
+  return data;
+}
+
+/* ---- registering a newly installed NAP box as a billing Area ----
+ *
+ * A box put up in the field does not exist in billing, so the first subscriber
+ * hung off it cannot be filed under it: the area picker has no such entry and
+ * the push refuses to write an area billing does not know. Somebody had to
+ * remember to add it by hand, and when they forgot the failure surfaced hours
+ * later, with the technician long gone from the pole.
+ *
+ * staffArea.php keeps the master list. Adding is a single field, so unlike the
+ * subscriber form there is nothing here to read-modify-write.
+ */
+async function billingAddArea(rawName) {
+  if (USE_NEW_BILLING) {
+    const r = await newBillingFetch('/api/areas', { method: 'POST', body: { area: rawName }, passThrough: true });
+    catalogCache = { at: 0, data: null };
+    return r.body && typeof r.body.ok === 'boolean' ? r.body : { ok: false, created: false, error: `billing returned HTTP ${r.status}` };
+  }
+  const name = String(rawName == null ? '' : rawName).trim();
+  if (!name) return { ok: false, created: false, error: 'an area needs a name' };
+  if (name.length > 100) return { ok: false, created: false, error: 'that area name is too long to be real' };
+
+  /* Read the live list, not the cache: two NAP jobs finishing together must not
+     both decide the area is missing and add it twice. */
+  const before = parseSelectOptions(await billingGet('/addRecord.php'), 'area')
+    .map(o => o.value).filter(v => v && !/^select /i.test(v));
+  const already = before.find(a => a.toLowerCase() === name.toLowerCase());
+  if (already) return { ok: true, created: false, area: already, note: 'billing already had this area' };
+
+  await billingPost('/actions/addArea.php', { area: name, submit: '' });
+
+  /* Confirm against a fresh read. A 302 back to the page means the form was
+     accepted, not that the row landed, and a silently dropped area would send
+     the next technician round the same loop. */
+  catalogCache = { at: 0, data: null };
+  const after = parseSelectOptions(await billingGet('/addRecord.php'), 'area')
+    .map(o => o.value).filter(v => v && !/^select /i.test(v));
+  const found = after.find(a => a.toLowerCase() === name.toLowerCase());
+  if (!found) return { ok: false, created: false, error: 'billing accepted the form but the area is still not in the list' };
+  return { ok: true, created: true, area: found, areaCount: after.length };
+}
+
+/* ---- the push ----
+ * Order is fixed and each step is verified before the next: details, then
+ * billing, then the plan. TaokiNinam sends the welcome SMS at the end of that
+ * chain, so a half-finished record must never reach step three. */
+async function billingPush(input) {
+  if (USE_NEW_BILLING) {
+    const r = await newBillingFetch('/api/installs', { method: 'POST', body: input, passThrough: true, timeout: 60000 });
+    const out = Object.assign({ ok: false, steps: [] }, r.body || {});
+    if (!r.ok && !out.error) out.error = `billing returned HTTP ${r.status}`;
+    logPush({ username: input.username, id: out.recordId, ok: !!out.ok, steps: out.steps, error: out.error || '' });
+    return out;
+  }
+  const steps = [];
+  const record = await billingFindRecord(input.username);
+  const id = record.id;
+  if (!id) throw new Error('billing record has no id — cannot address it');
+
+  const catalog = await billingCatalog();
+  const area = String(input.area || '').trim();
+  if (area && !catalog.areas.includes(area)) {
+    throw new Error(`"${area}" is not one of the areas TaokiNinam offers — refusing to write an area billing does not know`);
+  }
+  const plan = String(input.plan || '').trim();
+  const product = catalog.products.find(pr => pr.name.toLowerCase() === plan.toLowerCase());
+  if (plan && !product) {
+    throw new Error(`"${plan}" is not a product in TaokiNinam — refusing to guess a plan`);
+  }
+
+  /* ---- step 1: the record itself ---- */
+  const editHtml = await billingGet(`/editRecord.php?id=${encodeURIComponent(id)}`);
+  const current = parseFormFields(editHtml, 'editRecords');
+  if (!current) throw new Error('could not read the current record form — TaokiNinam may have changed its markup');
+
+  /* Only ever overwrite with something. An empty ticket field leaves billing
+     as it was rather than erasing what is already there. */
+  const keep = (val, existing) => {
+    const v = String(val == null ? '' : val).trim();
+    return v === '' ? (existing || '') : v;
+  };
+  const payload = Object.assign({}, current);
+  payload.fname       = keep(input.fname, current.fname);
+  payload.lname       = keep(input.lname, current.lname);
+  payload.address     = keep(input.address, current.address);
+  payload.area        = keep(area, current.area);
+  payload.phone       = keep(input.phone, current.phone);
+  payload.coordinates = keep(input.coordinates, current.coordinates);
+  payload.civil       = keep(input.installDate, current.civil);     // Installation Date
+  payload.citizenship = keep(input.username, current.citizenship);  // account Remarks
+  payload.nap         = keep(area, current.nap);                    // NAP mirrors the Area
+  payload.nport       = keep(input.port, current.nport);
+  if (input.email) payload.email = keep(input.email, current.email);
+  payload.submit = current.submit || 'Submit';
+
+  const r1 = await billingPost(`/actions/editRecords.php?id=${encodeURIComponent(id)}`, payload);
+  const after1 = await billingFindRecord(input.username);
+  const landed = (want, got) => !want || String(got || '').trim().toLowerCase() === String(want).trim().toLowerCase();
+  if (!landed(input.fname, after1.fname) || !landed(input.lname, after1.lname) || !landed(area, after1.area)) {
+    steps.push({ step: 'details', status: 'failed', http: r1.status,
+      detail: 'the record did not come back with the values that were sent' });
+    logPush({ username: input.username, id, ok: false, steps });
+    return { ok: false, recordId: id, steps };
+  }
+  steps.push({ step: 'details', status: 'done', http: r1.status });
+
+  /* ---- step 2: billing ---- */
+  if (billingIsActive(after1)) {
+    /* Re-running must never move a due date that is already live. */
+    steps.push({ step: 'billing', status: 'skipped',
+      detail: `billing is already active (due ${after1.dueDate || 'unknown'}) — left untouched` });
+  } else {
+    const dueDate = input.dueDate || addOneMonth(input.installDate);
+    if (!dueDate) {
+      steps.push({ step: 'billing', status: 'failed', detail: 'no installation date, so no due date could be worked out' });
+      logPush({ username: input.username, id, ok: false, steps });
+      return { ok: false, recordId: id, steps };
+    }
+    const r2 = await billingPost(`/actions/billingToggle.php?id=${encodeURIComponent(id)}`, {
+      substype: input.substype || 'postpaid',
+      billing: dueDate,
+      billdays: String(input.billdays == null ? 10 : input.billdays),
+      submit: 'Submit',
+    });
+    const after2 = await billingFindRecord(input.username);
+    if (!billingIsActive(after2)) {
+      steps.push({ step: 'billing', status: 'failed', http: r2.status,
+        detail: 'billing still reads inactive after the activation was posted' });
+      logPush({ username: input.username, id, ok: false, steps });
+      return { ok: false, recordId: id, steps };
+    }
+    steps.push({ step: 'billing', status: 'done', http: r2.status, dueDate, billdays: input.billdays == null ? 10 : input.billdays });
+  }
+
+  /* ---- step 3: the plan (this is what triggers the welcome SMS) ---- */
+  if (!product) {
+    steps.push({ step: 'plan', status: 'skipped', detail: 'no plan on the ticket, so nothing to sync' });
+    logPush({ username: input.username, id, ok: true, steps });
+    return { ok: true, recordId: id, steps };
+  }
+  /* Re-syncing a plan that is already correct is not free: TaokiNinam sends the
+     welcome SMS on this step, so repeating it texts the subscriber again. A
+     ticket that is reopened and completed a second time must not do that. */
+  const already = await billingFindRecord(input.username);
+  if (String(already.products || '').trim().toLowerCase() === product.name.toLowerCase() &&
+      String(already.profile  || '').trim().toLowerCase() === String(product.profile).toLowerCase()) {
+    steps.push({ step: 'plan', status: 'skipped',
+      detail: `already on ${product.name} / ${product.profile} — left alone so the welcome SMS is not sent twice` });
+    logPush({ username: input.username, id, ok: true, steps });
+    return { ok: true, recordId: id, steps };
+  }
+
+  const detHtml = await billingGet(`/recordDetails.php?id=${encodeURIComponent(id)}`);
+  const svc = parseFormFields(detHtml, 'accountSettings') || {};
+  const svcPayload = Object.assign({}, svc, {
+    service: input.service || 'pppoe',
+    products: product.name,
+    profile_pppoe: product.profile,
+    username: keep(record.username, svc.username),
+    password: keep(record.password, svc.password),
+    submit: svc.submit || 'Submit',
+  });
+  const r3 = await billingPost(`/actions/accountSettings.php?id=${encodeURIComponent(id)}`, svcPayload);
+  const after3 = await billingFindRecord(input.username);
+  if (String(after3.products || '').trim().toLowerCase() !== product.name.toLowerCase()) {
+    steps.push({ step: 'plan', status: 'failed', http: r3.status,
+      detail: `billing still shows "${after3.products || 'no plan'}" instead of "${product.name}"` });
+    logPush({ username: input.username, id, ok: false, steps });
+    return { ok: false, recordId: id, steps };
+  }
+  steps.push({ step: 'plan', status: 'done', http: r3.status, product: product.name, profile: product.profile });
+  logPush({ username: input.username, id, ok: true, steps });
+  return { ok: true, recordId: id, steps };
+}
+
+/* The customer list changes a few times a day, not every 30 s. Downloading the
+   whole billing export on every poll was most of this service's network traffic,
+   so it is fetched at most every BILLING_REFRESH_MINUTES (default 15) and reused
+   in between. A failed fetch keeps the last good copy. */
+const BILLING_REFRESH_MS = Math.max(1, parseInt(process.env.BILLING_REFRESH_MINUTES || '15', 10)) * 60 * 1000;
+let enrichCache = null;          // { map, at }
+async function fetchBillingEnrichment() {
+  if (!BILLING_ENABLED) return { map: new Map(), error: null };
+  if (enrichCache && Date.now() - enrichCache.at < BILLING_REFRESH_MS) return { map: enrichCache.map, error: null, cachedAt: enrichCache.at };
+  const fresh = await fetchBillingEnrichmentNow();
+  if (!fresh.error) { enrichCache = { map: fresh.map, at: Date.now() }; return { ...fresh, cachedAt: enrichCache.at }; }
+  if (enrichCache) return { map: enrichCache.map, error: fresh.error, cachedAt: enrichCache.at };
+  return fresh;
+}
+async function fetchBillingEnrichmentNow() {
+  if (USE_NEW_BILLING) {
+    try { return { map: await newBillingEnrichment(), error: null }; }
+    catch (err) { return { map: new Map(), error: describeFetchError(err) }; }
+  }
+  try {
+    const csvText = await billingFetchCsv();
+    const rows = parseCsv(csvText);
+    if (!rows.length) throw new Error('billing export returned no rows');
+
+    const header = rows[0];
+    const col = name => header.indexOf(name);
+    const iAccount  = col('ACCOUNT');
+    const iFname    = col('FNAME');
+    const iLname    = col('LNAME');
+    const iArea     = col('AREA');
+    const iPhone    = col('PHONE');
+    const iUsername = col('USERNAME');
+    const iNap      = col('NAP');
+    const iPort     = col('PORT');
+
+    if (iUsername === -1) throw new Error('billing export missing USERNAME column');
+
+    const map = new Map();
+    for (let r = 1; r < rows.length; r++) {
+      const row = rows[r];
+      const username = (row[iUsername] || '').trim();
+      if (!username) continue;
+
+      const fname = (row[iFname] || '').trim();
+      const lname = (row[iLname] || '').trim();
+      const nap   = (row[iNap]   || '').trim();
+      const port  = (row[iPort]  || '').trim();
+
+      map.set(username.toLowerCase(), {
+        accountNo:    (row[iAccount] || '').trim(),
+        customerName: [fname, lname].filter(Boolean).join(' '),
+        contactNo:    (row[iPhone] || '').trim(),
+        area:         (row[iArea] || '').trim(),
+        napBox:       [nap, port].filter(Boolean).join(' / '),
+      });
+    }
+
+    return { map, error: null };
+  } catch (err) {
+    return { map: new Map(), error: describeFetchError(err) };
+  }
+}
+
+async function pollRouter() {
+  try {
+    const [activeOut, secretOut] = await sshExecMany(['/ppp active print terse', '/ppp secret print terse']);
+
+    const activeByName = new Map(parseTerse(activeOut).map(r => [r.name, r]));
+    const secretRows   = parseTerse(secretOut);
+
+    const now = new Date();
+    const prevByUsername = new Map(state.accounts.map(a => [a.username, a]));
+    const enrichment = await fetchBillingEnrichment();
+
+    const updated = [];
+    for (const secret of secretRows) {
+      const username = secret.name;
+      if (!username) continue;
+
+      const active   = activeByName.get(username);
+      const isOnline = Boolean(active);
+      const prev     = prevByUsername.get(username);
+      const justWentOffline = !isOnline && prev && prev.status === 'online';
+
+      // RouterOS tracks this per-secret already — same value shown in
+      // Winbox under PPP > Secrets > Last Logged Out. Far more reliable
+      // than trying to pattern-match /log message text.
+      //
+      // Carry the previous value forward by default — including while the
+      // account is back online. Otherwise the moment an account recovers,
+      // this resets to null and the event becomes permanently invisible to
+      // the Today/Week/Month/Year "Recovered" buckets, since those require
+      // lastLogout to still be set even after status flips back to online.
+      let lastLogout = prev ? prev.lastLogout : null;
+      let logSource  = prev ? prev.logSource  : null;
+
+      if (!isOnline) {
+        const parsed = parseRouterOsTime(secret['last-logged-out']);
+        // RouterOS uses the epoch (jan/01/1970) as a sentinel for "this
+        // secret has never logged out" — treat that as no data, not a
+        // real timestamp.
+        if (parsed && parsed.getFullYear() <= 1971) {
+          if (justWentOffline) { lastLogout = now.toISOString(); logSource = 'poll'; }
+        } else if (parsed) {
+          lastLogout = parsed.toISOString();
+          logSource = 'secret';
+        } else if (justWentOffline) {
+          lastLogout = now.toISOString();
+          logSource = 'poll';
+        }
+      }
+
+      // Flap count: how many times this account has gone online -> offline
+      // since monitor.js started (see monitorStartedAt) — a modem that
+      // keeps disconnecting/reconnecting racks this up quickly, which the
+      // current-status view alone can't show. There's no database, so
+      // this resets to 0 whenever the process restarts/redeploys.
+      const flapCount = (prev ? prev.flapCount || 0 : 0) + (justWentOffline ? 1 : 0);
+
+      const enrich = enrichment.map.get(username.toLowerCase()) || {};
+
+      updated.push({
+        username,
+        profile: secret.profile || '',
+        comment: secret.comment || '',
+        localIp: secret['local-address'] || '',
+        remoteIp: isOnline ? (active.address || secret['remote-address'] || '') : (secret['remote-address'] || ''),
+        status: isOnline ? 'online' : 'offline',
+        lastSeen: isOnline ? now.toISOString() : (prev ? prev.lastSeen : null),
+        lastLogout,
+        logSource,
+        flapCount,
+        // Current session uptime, straight from the router's active
+        // connection record. Only meaningful while online — an offline
+        // account has no active session, so this clears rather than
+        // showing a stale duration from its last session.
+        uptime: isOnline ? (active.uptime || '') : '',
+        uptimeSec: isOnline ? parseRouterOsUptime(active.uptime) : null,
+        customerName: enrich.customerName || '',
+        accountNo: enrich.accountNo || '',
+        contactNo: enrich.contactNo || '',
+        area: enrich.area || '',
+        napBox: enrich.napBox || '',
+      });
+    }
+
+    // Default sort: offline (most recently logged out) first
+    updated.sort((a, b) => {
+      if (a.status !== b.status) return a.status === 'offline' ? -1 : 1;
+      if (a.status === 'offline') {
+        const ta = a.lastLogout ? new Date(a.lastLogout).getTime() : 0;
+        const tb = b.lastLogout ? new Date(b.lastLogout).getTime() : 0;
+        return tb - ta;
+      }
+      return a.username.localeCompare(b.username);
+    });
+
+    const downCount = updated.filter(a => a.status === 'offline').length;
+
+    const todayStr = now.toDateString();
+    const todayDownCount = updated.filter(a =>
+      a.status === 'offline' &&
+      a.lastLogout &&
+      new Date(a.lastLogout).toDateString() === todayStr
+    ).length;
+    const alertActive = todayDownCount >= ALERT_THRESHOLD;
+
+    state = {
+      ...state,
+      accounts: updated,
+      downCount,
+      todayDownCount,
+      totalCount: updated.length,
+      alertActive,
+      alertSince: alertActive ? (state.alertSince || now.toISOString()) : null,
+      lastPoll: now.toISOString(),
+      pollError: null,
+      billingLastSync: enrichment.cachedAt ? new Date(enrichment.cachedAt).toISOString() : (enrichment.error ? state.billingLastSync : (BILLING_ENABLED ? now.toISOString() : null)),
+      billingError: enrichment.error,
+      billingCustomerCount: enrichment.map.size,
+    };
+
+    broadcast();
+  } catch (err) {
+    const msg = describeFetchError(err);
+    state = { ...state, pollError: msg, lastPoll: new Date().toISOString() };
+    broadcast();
+    console.error(`[${new Date().toISOString()}] Poll error:`, msg);
+  }
+}
+
+/* Live dashboard updates. The full state (every account) is sent only when
+   something that matters changed — status, alarms, ISP links, billing — or at
+   least every FULL_PUSH_MINUTES (default 5) so uptimes stay fresh. In between,
+   open dashboards get a tiny "tick" with the poll time. Each open tab used to
+   receive the whole account list twice every 30 s. */
+const FULL_PUSH_MS = Math.max(1, parseInt(process.env.FULL_PUSH_MINUTES || '5', 10)) * 60 * 1000;
+let lastFullKey = '', lastFullAt = 0;
+function significantKey(st) {
+  return JSON.stringify({
+    a: (st.accounts || []).map(a => [a.username, a.status, a.lastLogout, a.flapCount, a.remoteIp, a.profile, a.customerName, a.area, a.napBox]),
+    d: st.downCount, t: st.todayDownCount, al: st.alertActive, pe: st.pollError, be: st.billingError, bc: st.billingCustomerCount,
+    i: (st.isps || []).map(i => [i.name, i.online]),
+  });
+}
+function broadcast() {
+  if (!sseClients.size) return;
+  const key = significantKey(state);
+  let payload;
+  if (key !== lastFullKey || Date.now() - lastFullAt >= FULL_PUSH_MS) {
+    payload = `data: ${JSON.stringify(state)}\n\n`;
+    lastFullKey = key; lastFullAt = Date.now();
+  } else {
+    payload = `event: tick\ndata: ${JSON.stringify({ lastPoll: state.lastPoll, pollIntervalSec: state.pollIntervalSec })}\n\n`;
+  }
+  for (const client of sseClients) {
+    try { client.write(payload); } catch {}
+  }
+}
+
+// ---------- Dashboard HTML ----------
+
+function dashboardHtml() {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>StarLine Internet Customer Uptime Monitor</title>
+<style>
+:root {
+  --bg:       #0e1018;
+  --sidebar:  #13151f;
+  --card:     #181b28;
+  --card2:    #1e2130;
+  --border:   #252840;
+  --green:    #8dc63f;
+  --red:      #e84040;
+  --amber:    #f59e0b;
+  --blue:     #4a8fd4;
+  --purple:   #9b59b6;
+  --text:     #c8d0e0;
+  --dim:      #48506a;
+  --accent:   #4f6ef7;
+  --isp-up:     #38bdf8;
+  --isp-down:   #fb923c;
+  --isp-accent: #818cf8;
+}
+* { box-sizing: border-box; margin:0; padding:0; }
+body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text); min-height:100vh; display:flex; flex-direction:column; }
+
+/* ---- Alert banner ---- */
+#alert-banner {
+  display:none; background:var(--red); color:#fff;
+  padding:12px 24px; font-size:14px; font-weight:600; letter-spacing:.3px;
+  animation: abpulse 1.3s infinite; gap:14px; z-index:200; flex-shrink:0;
+}
+#alert-banner.active { display:flex; align-items:center; justify-content:center; }
+@keyframes abpulse { 0%,100%{background:#e84040} 50%{background:#7f1d1d} }
+#mute-btn { background:rgba(255,255,255,.15); border:1px solid rgba(255,255,255,.3); border-radius:5px; color:#fff; font-size:12px; padding:4px 12px; cursor:pointer; flex-shrink:0; }
+#mute-btn:hover { background:rgba(255,255,255,.25); }
+
+/* ---- Layout ---- */
+#app { display:flex; flex:1; overflow:hidden; }
+
+/* ---- Sidebar ---- */
+.sidebar {
+  width:60px; background:var(--sidebar); border-right:1px solid var(--border);
+  display:flex; flex-direction:column; align-items:center; padding:12px 0; gap:4px;
+  flex-shrink:0;
+}
+.slogo {
+  font-size:20px; padding:10px 0 16px; border-bottom:1px solid var(--border);
+  width:100%; text-align:center; margin-bottom:8px;
+}
+.snav {
+  width:44px; height:44px; border-radius:8px; display:flex; align-items:center; justify-content:center;
+  font-size:18px; cursor:pointer; transition:background .15s; color:var(--dim); position:relative;
+}
+.snav:hover { background:var(--card2); color:var(--text); }
+.snav.active { background:var(--accent); color:#fff; }
+.snav .stip {
+  position:absolute; left:54px; background:#1e2130; border:1px solid var(--border);
+  color:var(--text); font-size:11px; padding:4px 8px; border-radius:4px;
+  white-space:nowrap; display:none; pointer-events:none; z-index:100;
+}
+.snav:hover .stip { display:block; }
+
+/* ---- Main ---- */
+.main { flex:1; display:flex; flex-direction:column; overflow:hidden; }
+
+/* ---- Top bar ---- */
+.topbar {
+  background:var(--card); border-bottom:1px solid var(--border);
+  padding:14px 24px; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px;
+}
+.topbar h1 { font-size:17px; font-weight:700; color:#e8ecf5; display:flex; align-items:center; gap:8px; }
+.topbar .meta { font-size:11px; color:var(--dim); display:flex; gap:16px; flex-wrap:wrap; }
+.topbar .meta span strong { color:#8090a8; }
+
+/* ---- Scrollable content ---- */
+.content { flex:1; overflow-y:auto; padding:20px 24px 32px; display:flex; flex-direction:column; gap:20px; }
+
+/* ---- ISP uplink monitoring ---- */
+.isp-panel {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 14px;
+  margin-bottom: 4px;
+}
+.isp-card {
+  background: linear-gradient(150deg, #171b34, #1c2148);
+  border: 1px solid #2c3568; border-radius: 12px;
+  padding: 16px 18px; position: relative; overflow: hidden;
+  display: flex; flex-direction: column; gap: 8px;
+}
+.isp-card::before {
+  content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 4px;
+  background: var(--isp-up);
+}
+.isp-card[data-online="false"]::before { background: var(--isp-down); }
+.isp-card[data-online="null"]::before  { background: var(--isp-accent); }
+.isp-top { display: flex; align-items: center; gap: 6px; }
+.isp-status-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--isp-up); box-shadow: 0 0 6px var(--isp-up);
+}
+.isp-card[data-online="false"] .isp-status-dot { background: var(--isp-down); box-shadow: 0 0 6px var(--isp-down); }
+.isp-card[data-online="null"] .isp-status-dot  { background: var(--isp-accent); box-shadow: 0 0 6px var(--isp-accent); }
+.isp-status-label {
+  font-size: 10px; font-weight: 700; letter-spacing: .6px;
+  color: #7dd3fc; text-transform: uppercase;
+}
+.isp-card[data-online="false"] .isp-status-label { color: #fdba74; }
+.isp-card[data-online="null"]  .isp-status-label { color: #c7d2fe; }
+.isp-name { font-size: 14px; font-weight: 700; color: #e2e8f5; }
+.isp-plan { font-size: 11px; color: #8b93b8; }
+.isp-ip   { font-size: 11px; color: #7a85a0; font-family: monospace; }
+.isp-latency { font-size: 13px; color: var(--isp-up); font-weight: 700; margin-top: auto; }
+.isp-card[data-online="false"] .isp-latency { color: var(--isp-down); }
+.isp-card[data-online="null"]  .isp-latency { color: var(--isp-accent); }
+
+/* ---- Overview: left big live card + right 2x2 history grid ---- */
+.overview-panel {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  margin-bottom: 20px;
+}
+
+/* Big live card (left half) */
+.live-card {
+  background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+  padding: 28px; cursor: pointer; transition: border-color .2s, background .2s;
+  position: relative; overflow: hidden;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  min-height: 320px;
+}
+.live-card:hover    { border-color: var(--accent); background: var(--card2); }
+.live-card.selected { border-color: var(--accent); background: var(--card2); }
+.live-card.selected::before {
+  content:''; position:absolute; left:0; top:0; bottom:0; width:4px;
+  background: var(--accent); border-radius: 12px 0 0 12px;
+}
+.lc-header {
+  align-self: flex-start; margin-bottom: 24px;
+}
+.lc-label {
+  font-size: 13px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: .7px; color: #e2e8f5;
+}
+.lc-sub {
+  font-size: 12px; color: #7a85a0; margin-top: 3px;
+}
+.lc-donut-wrap { position: relative; margin-bottom: 28px; }
+.lc-donut-wrap svg { display: block; }
+.lc-donut-center {
+  position: absolute; inset: 0; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; pointer-events: none;
+}
+.lc-big-num { font-size: 48px; font-weight: 700; line-height: 1; color: var(--text); }
+.lc-big-lbl { font-size: 12px; color: var(--dim); text-transform: uppercase; letter-spacing: .5px; margin-top: 5px; }
+.lc-stats   { display: flex; gap: 36px; }
+.lc-stat    { text-align: center; }
+.lc-stat-n  { font-size: 32px; font-weight: 700; line-height: 1; }
+.lc-stat-n.green { color: var(--green); }
+.lc-stat-n.red   { color: var(--red); }
+.lc-stat-l  { font-size: 12px; color: #9aa8c0; margin-top: 5px; text-transform: uppercase; letter-spacing: .4px; }
+
+/* Right 2×2 history grid */
+.history-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  grid-template-rows: 1fr 1fr;
+  gap: 14px;
+}
+
+/* History cards */
+.dcard {
+  background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+  padding: 18px 20px; cursor: pointer; transition: border-color .2s, background .2s;
+  position: relative; overflow: hidden;
+  display: flex; flex-direction: column; justify-content: space-between;
+}
+.dcard:hover    { border-color: var(--accent); background: var(--card2); }
+.dcard.selected { border-color: var(--accent); background: var(--card2); }
+.dcard.selected::before {
+  content:''; position:absolute; left:0; top:0; bottom:0; width:3px;
+  background: var(--accent); border-radius: 10px 0 0 10px;
+}
+.dcard-title { font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: .7px; color: #e2e8f5; margin-bottom: 14px; }
+.dcard-body  { display: flex; align-items: center; gap: 16px; flex: 1; }
+
+/* Donut (history cards) */
+.donut-wrap { position: relative; flex-shrink: 0; }
+.donut-wrap svg { display: block; }
+.donut-center {
+  position: absolute; inset: 0; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; pointer-events: none;
+}
+.donut-num { font-size: 20px; font-weight: 700; line-height: 1; }
+.donut-lbl { font-size: 9px; color: var(--dim); text-transform: uppercase; margin-top: 3px; letter-spacing: .4px; }
+
+.dcard-counts { display: flex; flex-direction: column; gap: 10px; flex: 1; }
+.count-row    { display: flex; align-items: center; gap: 9px; }
+.count-dot    { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
+.count-dot.green { background: var(--green); box-shadow: 0 0 5px var(--green)44; }
+.count-dot.red   { background: var(--red); }
+.count-num   { font-size: 22px; font-weight: 700; line-height: 1; min-width: 36px; }
+.count-label { color: #9aa8c0; font-size: 12px; font-weight: 500; }
+
+/* ---- Section header ---- */
+.section-header { display:flex; align-items:center; gap:12px; margin-bottom:2px; }
+.section-title  { font-size:13px; font-weight:600; color:#8090a8; text-transform:uppercase; letter-spacing:.5px; }
+.section-line   { flex:1; height:1px; background:var(--border); }
+
+/* ---- Toolbar ---- */
+.toolbar { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+.tb-input {
+  background:var(--card2); border:1px solid var(--border); border-radius:7px;
+  padding:7px 12px; color:var(--text); font-size:13px; width:210px; outline:none;
+}
+.tb-input:focus { border-color:var(--accent); }
+.tb-btn {
+  background:var(--card2); border:1px solid var(--border); border-radius:7px;
+  padding:7px 13px; color:var(--dim); font-size:12px; cursor:pointer; transition:all .15s; white-space:nowrap;
+}
+.tb-btn.active { background:var(--accent); border-color:var(--accent); color:#fff; }
+.tb-btn:hover:not(.active) { border-color:var(--accent); color:var(--text); }
+.tb-divider { width:1px; height:24px; background:var(--border); }
+.tb-select {
+  background:var(--card2); border:1px solid var(--border); border-radius:7px;
+  padding:7px 12px; color:var(--text); font-size:12px; outline:none; cursor:pointer;
+}
+.tb-select:focus { border-color:var(--accent); }
+label.tb-label { font-size:11px; color:var(--dim); }
+
+/* ---- Table ---- */
+.table-wrap { overflow-x:auto; }
+table { width:100%; border-collapse:collapse; font-size:13px; }
+thead th {
+  text-align:left; padding:9px 12px; font-size:10px; font-weight:600;
+  text-transform:uppercase; letter-spacing:.5px; color:var(--dim);
+  border-bottom:1px solid var(--border); cursor:pointer; user-select:none; white-space:nowrap;
+  background:var(--card);
+}
+thead th:hover { color:#8090a8; }
+thead th .arr { margin-left:3px; opacity:.3; }
+thead th.sorted .arr { opacity:1; color:var(--accent); }
+tbody tr { border-bottom:1px solid #151720; transition:background .1s; }
+tbody tr:hover { background:var(--card2); }
+tbody tr.new-offline { animation:rowpop 2.5s ease-out forwards; }
+@keyframes rowpop { 0%{background:#7f1d1d44} 100%{background:transparent} }
+tbody td { padding:9px 12px; color:#9aa3bc; vertical-align:middle; }
+
+/* Status badges */
+.badge { display:inline-flex; align-items:center; gap:5px; padding:3px 9px; border-radius:20px; font-size:11px; font-weight:600; }
+.badge::before { content:''; width:6px; height:6px; border-radius:50%; }
+.badge.online  { background:#14532d33; color:#4ade80; border:1px solid #166534; }
+.badge.offline { background:#7f1d1d33; color:#f87171; border:1px solid #991b1b; }
+.badge.online::before  { background:var(--green); box-shadow:0 0 4px var(--green); }
+.badge.offline::before { background:var(--red); }
+
+.src-tag { display:inline-block; font-size:9px; padding:1px 5px; border-radius:3px; margin-left:5px; font-weight:600; vertical-align:middle; }
+.src-tag.secret { background:#1e3a5f; color:#60a5fa; border:1px solid #1e40af; }
+.src-tag.poll   { background:#2d2a1e; color:#fbbf24; border:1px solid #78350f; }
+
+.mono  { font-family:monospace; font-size:12px; }
+.bold  { font-weight:600; color:#c8d0e0; }
+
+#error-bar { display:none; background:#7f1d1d; color:#fca5a5; padding:9px 24px; font-size:12px; }
+#error-bar.active { display:block; }
+#no-results { text-align:center; color:var(--dim); padding:36px; font-size:13px; }
+
+/* ---- Mobile ---- */
+@media (max-width: 900px) {
+  .overview-panel { grid-template-columns: 1fr; }
+  .live-card { min-height: 240px; padding: 20px; }
+}
+@media (max-width: 640px) {
+  .sidebar { width: 44px; padding: 8px 0; }
+  .slogo { font-size: 16px; padding: 6px 0 10px; }
+  .snav { width: 32px; height: 32px; font-size: 15px; }
+  .snav .stip { display: none !important; }
+  .topbar { padding: 10px 12px; }
+  .topbar h1 { font-size: 14px; gap: 5px; }
+  .topbar h1 span { display: none; }
+  .topbar .meta { font-size: 10px; gap: 8px 12px; }
+  .content { padding: 12px 10px 24px; gap: 14px; }
+  .isp-panel { grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; }
+  .isp-card { padding: 12px 14px; }
+  .history-grid { grid-template-columns: 1fr; grid-template-rows: none; gap: 10px; }
+  .lc-donut-wrap svg { width: 140px; height: 140px; }
+  .lc-stats { gap: 22px; }
+  .lc-big-num { font-size: 36px; }
+  .lc-stat-n { font-size: 24px; }
+  .toolbar { gap: 6px; }
+  .tb-input { width: 100%; flex: 1 1 100%; }
+  .tb-select { flex: 1 1 auto; }
+  table { font-size: 11px; }
+  thead th, tbody td { padding: 7px 8px; }
+}
+</style>
+</head>
+<body>
+
+<div id="alert-banner">
+  <span>⚠️ ALARM — <span id="al-count">0</span> subscribers went offline TODAY and are still down! Since: <span id="al-since">—</span></span>
+  <button id="mute-btn" onclick="toggleMute()">🔇 Mute</button>
+</div>
+
+<div id="app">
+
+  <!-- Sidebar -->
+  <nav class="sidebar">
+    <div class="slogo">📡</div>
+    <div class="snav active" id="snav-dash" onclick="setView('dashboard')">
+      ⊞ <span class="stip">Dashboard</span>
+    </div>
+    <div class="snav" id="snav-table" onclick="setView('table')">
+      ☰ <span class="stip">Account List</span>
+    </div>
+  </nav>
+
+  <!-- Main -->
+  <div class="main">
+    <div id="error-bar"></div>
+
+    <!-- Top bar -->
+    <div class="topbar">
+      <h1>📡 StarLine Internet Customer Uptime Monitor <span style="font-size:12px;color:var(--dim);font-weight:400" id="tb-host"></span></h1>
+      <div class="meta">
+        <span>Last poll: <strong id="tb-poll">—</strong></span>
+        <span>Next: <strong id="tb-next">—</strong>s</span>
+        <span>Interval: <strong id="tb-interval">—</strong>s</span>
+        <span>Alert at: <strong id="tb-thresh">—</strong>+ offline</span>
+        <span>Billing: <strong id="tb-billing">—</strong></span>
+        <span>Flap counts since: <strong id="tb-started">—</strong></span>
+      </div>
+    </div>
+
+    <!-- Scrollable content -->
+    <div class="content">
+
+      <!-- Dashboard view -->
+      <div id="view-dashboard">
+
+        <div class="section-header"><span class="section-title">ISP Links</span><div class="section-line"></div></div>
+
+        <div class="isp-panel" id="isp-panel"></div>
+
+        <div class="section-header"><span class="section-title">Overview</span><div class="section-line"></div></div>
+
+        <div class="overview-panel">
+
+          <!-- LEFT: Big live status card -->
+          <div class="live-card selected" id="card-live" onclick="selectCard('live')">
+            <div class="lc-header">
+              <div class="lc-label">All Accounts — Live Status</div>
+              <div class="lc-sub" id="lc-router">Connecting…</div>
+            </div>
+            <div class="lc-donut-wrap">
+              <svg id="svg-live" width="180" height="180" viewBox="0 0 180 180"></svg>
+              <div class="lc-donut-center">
+                <div class="lc-big-num" id="dn-live">—</div>
+                <div class="lc-big-lbl">Total</div>
+              </div>
+            </div>
+            <div class="lc-stats">
+              <div class="lc-stat">
+                <div class="lc-stat-n green" id="cn-live-on">—</div>
+                <div class="lc-stat-l">🟢 Online</div>
+              </div>
+              <div class="lc-stat">
+                <div class="lc-stat-n red" id="cn-live-off">—</div>
+                <div class="lc-stat-l">🔴 Offline</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- RIGHT: 2×2 history cards -->
+          <div class="history-grid">
+
+            <div class="dcard" id="card-today" onclick="selectCard('today')">
+              <div class="dcard-title">Today</div>
+              <div class="dcard-body">
+                <div class="donut-wrap">
+                  <svg id="svg-today" width="90" height="90" viewBox="0 0 90 90"></svg>
+                  <div class="donut-center"><div class="donut-num" id="dn-today">—</div><div class="donut-lbl">Events</div></div>
+                </div>
+                <div class="dcard-counts">
+                  <div class="count-row"><div class="count-dot red"></div><div class="count-num" id="cn-today-off">—</div><div class="count-label">Still Down</div></div>
+                  <div class="count-row"><div class="count-dot green"></div><div class="count-num" id="cn-today-on">—</div><div class="count-label">Recovered</div></div>
+                </div>
+              </div>
+            </div>
+
+            <div class="dcard" id="card-week" onclick="selectCard('week')">
+              <div class="dcard-title">This Week</div>
+              <div class="dcard-body">
+                <div class="donut-wrap">
+                  <svg id="svg-week" width="90" height="90" viewBox="0 0 90 90"></svg>
+                  <div class="donut-center"><div class="donut-num" id="dn-week">—</div><div class="donut-lbl">Events</div></div>
+                </div>
+                <div class="dcard-counts">
+                  <div class="count-row"><div class="count-dot red"></div><div class="count-num" id="cn-week-off">—</div><div class="count-label">Still Down</div></div>
+                  <div class="count-row"><div class="count-dot green"></div><div class="count-num" id="cn-week-on">—</div><div class="count-label">Recovered</div></div>
+                </div>
+              </div>
+            </div>
+
+            <div class="dcard" id="card-month" onclick="selectCard('month')">
+              <div class="dcard-title">This Month</div>
+              <div class="dcard-body">
+                <div class="donut-wrap">
+                  <svg id="svg-month" width="90" height="90" viewBox="0 0 90 90"></svg>
+                  <div class="donut-center"><div class="donut-num" id="dn-month">—</div><div class="donut-lbl">Events</div></div>
+                </div>
+                <div class="dcard-counts">
+                  <div class="count-row"><div class="count-dot red"></div><div class="count-num" id="cn-month-off">—</div><div class="count-label">Still Down</div></div>
+                  <div class="count-row"><div class="count-dot green"></div><div class="count-num" id="cn-month-on">—</div><div class="count-label">Recovered</div></div>
+                </div>
+              </div>
+            </div>
+
+            <div class="dcard" id="card-year" onclick="selectCard('year')">
+              <div class="dcard-title">This Year</div>
+              <div class="dcard-body">
+                <div class="donut-wrap">
+                  <svg id="svg-year" width="90" height="90" viewBox="0 0 90 90"></svg>
+                  <div class="donut-center"><div class="donut-num" id="dn-year">—</div><div class="donut-lbl">Events</div></div>
+                </div>
+                <div class="dcard-counts">
+                  <div class="count-row"><div class="count-dot red"></div><div class="count-num" id="cn-year-off">—</div><div class="count-label">Still Down</div></div>
+                  <div class="count-row"><div class="count-dot green"></div><div class="count-num" id="cn-year-on">—</div><div class="count-label">Recovered</div></div>
+                </div>
+              </div>
+            </div>
+
+          </div><!-- /history-grid -->
+        </div><!-- /overview-panel -->
+
+        <div class="section-header"><span class="section-title" id="table-section-title">All Accounts — Live</span><div class="section-line"></div></div>
+
+      </div>
+      <!-- /Dashboard view -->
+
+      <!-- Toolbar (always shown) -->
+      <div class="toolbar">
+        <input class="tb-input" id="search" type="text" placeholder="Search username, customer, account #, area, NAP…" oninput="applyDisplay()">
+        <div class="tb-divider" id="filt-div"></div>
+        <span id="filt-btns">
+          <button class="tb-btn active" id="btn-all"     onclick="setFilter('all')">All</button>
+          <button class="tb-btn"        id="btn-online"  onclick="setFilter('online')">🟢 Online</button>
+          <button class="tb-btn"        id="btn-offline" onclick="setFilter('offline')">🔴 Offline</button>
+        </span>
+        <div class="tb-divider"></div>
+        <label class="tb-label">Sort:</label>
+        <select class="tb-select" id="sort-select" onchange="applyDisplay()">
+          <option value="offline-recent">Offline — recent logout first</option>
+          <option value="offline-oldest">Offline — oldest logout first</option>
+          <option value="status-az">Status (offline → online)</option>
+          <option value="username-az">Username A–Z</option>
+          <option value="username-za">Username Z–A</option>
+          <option value="customer-az">Customer A–Z</option>
+          <option value="lastseen-desc">Last Seen (newest)</option>
+          <option value="flaps-desc">Most Flaps</option>
+          <option value="uptime-desc">Uptime (longest first)</option>
+          <option value="uptime-asc">Uptime (shortest first)</option>
+        </select>
+      </div>
+
+      <!-- Table -->
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th onclick="setSort('status-az')">Status <span class="arr" id="arr-status"></span></th>
+              <th onclick="setSort('username-az')">Username <span class="arr" id="arr-username"></span></th>
+              <th onclick="setSort('customer-az')">Customer <span class="arr" id="arr-customer"></span></th>
+              <th>Account #</th>
+              <th>Contact #</th>
+              <th>Area</th>
+              <th>NAP Box</th>
+              <th>Profile</th>
+              <th>Remote IP</th>
+              <th>Comment</th>
+              <th onclick="setSort('uptime-desc')" title="How long the current session has been up (online accounts only)">Uptime <span class="arr" id="arr-uptime"></span></th>
+              <th onclick="setSort('lastseen-desc')">Last Seen <span class="arr" id="arr-lastseen"></span></th>
+              <th onclick="setSort('offline-recent')">Logged Out At <span class="arr" id="arr-logout"></span></th>
+              <th onclick="setSort('flaps-desc')" title="Times gone offline since the dashboard started">Flaps <span class="arr" id="arr-flaps"></span></th>
+            </tr>
+          </thead>
+          <tbody id="tbody"></tbody>
+        </table>
+        <div id="no-results"></div>
+      </div>
+
+    </div><!-- /content -->
+  </div><!-- /main -->
+</div><!-- /app -->
+
+<script>
+// ---- State ----
+let allAccounts   = [];
+let selectedCard  = 'live';
+let currentFilter = 'all';
+let currentView   = 'dashboard';
+let muted         = false;
+let alarmCtx      = null;
+let alarmTimer    = null;
+let wasAlert      = false;
+let cdTimer       = null;
+
+// ---- SSE ----
+const evtSource = new EventSource('/events');
+evtSource.onmessage = e => render(JSON.parse(e.data));
+/* between full updates the server only says "polled at …" */
+evtSource.addEventListener('tick', e => {
+  const t = JSON.parse(e.data);
+  document.getElementById('tb-poll').textContent = fmt(t.lastPoll);
+  clearInterval(cdTimer);
+  let rem = t.pollIntervalSec || 30;
+  document.getElementById('tb-next').textContent = rem;
+  cdTimer = setInterval(() => { rem=Math.max(0,rem-1); document.getElementById('tb-next').textContent=rem; }, 1000);
+});
+evtSource.onerror   = () => {
+  document.getElementById('error-bar').textContent = 'Lost connection — is node monitor.js still running?';
+  document.getElementById('error-bar').classList.add('active');
+};
+
+// ---- Audio ----
+function getACtx()  { if (!alarmCtx) alarmCtx = new (window.AudioContext||window.webkitAudioContext)(); return alarmCtx; }
+function beep(f,t,d,ctx) {
+  const o=ctx.createOscillator(), g=ctx.createGain();
+  o.connect(g); g.connect(ctx.destination);
+  o.type='square'; o.frequency.setValueAtTime(f,t);
+  g.gain.setValueAtTime(.15,t); g.gain.exponentialRampToValueAtTime(.001,t+d);
+  o.start(t); o.stop(t+d);
+}
+function playAlarm() { if(muted) return; try{ const c=getACtx(),t=c.currentTime; beep(1047,t,.15,c); beep(880,t+.2,.15,c); beep(1047,t+.4,.15,c); }catch(e){} }
+function startAlarm() { if(alarmTimer) return; playAlarm(); alarmTimer=setInterval(playAlarm,2200); }
+function stopAlarm()  { clearInterval(alarmTimer); alarmTimer=null; }
+function toggleMute() {
+  muted=!muted;
+  document.getElementById('mute-btn').textContent = muted ? '🔔 Unmute' : '🔇 Mute';
+  if(muted) stopAlarm(); else if(wasAlert) startAlarm();
+}
+
+// ---- ISP links panel ----
+function renderIsps(isps) {
+  const panel = document.getElementById('isp-panel');
+  if (!panel) return;
+  if (!isps || !isps.length) {
+    panel.innerHTML = '<div style="color:var(--dim);font-size:12px;">No ISP links configured.</div>';
+    return;
+  }
+  panel.innerHTML = isps.map(isp => {
+    const state = isp.online === null ? 'null' : (isp.online ? 'true' : 'false');
+    const label = isp.online === null ? 'Checking…' : (isp.online ? 'Online' : 'Offline');
+    const lat   = isp.online && isp.latencyMs != null ? Math.round(isp.latencyMs) + ' ms' : '—';
+    return \`<div class="isp-card" data-online="\${state}">
+      <div class="isp-top">
+        <span class="isp-status-dot"></span>
+        <span class="isp-status-label">\${label}</span>
+      </div>
+      <div class="isp-name">\${esc(isp.name)}</div>
+      <div class="isp-plan">\${esc(isp.plan)}</div>
+      <div class="isp-ip">\${esc(isp.ip)}</div>
+      <div class="isp-latency">\${lat}</div>
+    </div>\`;
+  }).join('');
+}
+
+// ---- Donut chart ----
+function drawDonut(svgId, good, bad, total) {
+  const svg = document.getElementById(svgId);
+  if (!svg) return;
+
+  // Detect size from viewBox: large (180) for live card, small (90) for history
+  const size = parseInt(svg.getAttribute('viewBox').split(' ')[2]);
+  const isLarge = size >= 180;
+  const cx = size/2, cy = size/2;
+  const r  = isLarge ? 68 : 32;
+  const sw = isLarge ? 18 : 11;
+
+  const circ = 2 * Math.PI * r;
+  const track = \`<circle cx="\${cx}" cy="\${cy}" r="\${r}" fill="none" stroke="#252840" stroke-width="\${sw}"/>\`;
+
+  if (total === 0) {
+    svg.innerHTML = track;
+    return;
+  }
+
+  const badRatio  = bad  / total;
+  const goodRatio = good / total;
+  const badDash   = badRatio  * circ;
+  const goodDash  = goodRatio * circ;
+
+  const badArc = bad > 0
+    ? \`<circle cx="\${cx}" cy="\${cy}" r="\${r}" fill="none" stroke="#e84040" stroke-width="\${sw}"
+        stroke-dasharray="\${badDash} \${circ - badDash}"
+        transform="rotate(-90 \${cx} \${cy})"/>\`
+    : '';
+
+  const greenRotate = -90 + (badRatio * 360);
+  const goodArc = good > 0
+    ? \`<circle cx="\${cx}" cy="\${cy}" r="\${r}" fill="none" stroke="#8dc63f" stroke-width="\${sw}"
+        stroke-dasharray="\${goodDash} \${circ - goodDash}"
+        transform="rotate(\${greenRotate} \${cx} \${cy})"/>\`
+    : '';
+
+  svg.innerHTML = track + badArc + goodArc;
+}
+
+// ---- Period helpers ----
+function inPeriod(iso, p) {
+  if (!iso) return false;
+  const d = new Date(iso), now = new Date();
+  switch(p) {
+    case 'today': return d.toDateString() === now.toDateString();
+    case 'week':  { const m=new Date(now); m.setHours(0,0,0,0); m.setDate(now.getDate()-((now.getDay()+6)%7)); return d>=m; }
+    case 'month': return d.getMonth()===now.getMonth() && d.getFullYear()===now.getFullYear();
+    case 'year':  return d.getFullYear()===now.getFullYear();
+    default: return false;
+  }
+}
+
+// ---- Format ----
+function fmt(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  return d.toLocaleDateString('en-PH',{month:'short',day:'numeric',year:'numeric'})
+       + ' ' + d.toLocaleTimeString('en-PH',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
+}
+function esc(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+// ---- Render from SSE ----
+function render(data) {
+  const eb = document.getElementById('error-bar');
+  if (data.pollError) { eb.textContent='⚠ Poll error: '+data.pollError; eb.classList.add('active'); }
+  else eb.classList.remove('active');
+
+  const banner = document.getElementById('alert-banner');
+  if (data.alertActive) {
+    document.getElementById('al-count').textContent = data.todayDownCount;
+    document.getElementById('al-since').textContent = fmt(data.alertSince);
+    banner.classList.add('active');
+    if (!wasAlert) startAlarm();
+  } else { banner.classList.remove('active'); stopAlarm(); }
+  wasAlert = data.alertActive;
+
+  document.getElementById('tb-host').textContent     = data.routerHost;
+  if (document.getElementById('lc-router')) document.getElementById('lc-router').textContent = data.routerHost;
+  document.getElementById('tb-poll').textContent     = fmt(data.lastPoll);
+  document.getElementById('tb-interval').textContent = data.pollIntervalSec;
+  document.getElementById('tb-thresh').textContent   = data.alertThreshold;
+  document.getElementById('tb-billing').textContent  = !data.billingEnabled
+    ? 'not configured'
+    : (data.billingError ? '⚠ ' + data.billingError : (data.billingCustomerCount + ' accounts synced ' + fmt(data.billingLastSync)));
+  document.getElementById('tb-started').textContent = fmt(data.monitorStartedAt);
+
+  clearInterval(cdTimer);
+  let rem = data.pollIntervalSec || 30;
+  document.getElementById('tb-next').textContent = rem;
+  cdTimer = setInterval(() => { rem=Math.max(0,rem-1); document.getElementById('tb-next').textContent=rem; }, 1000);
+
+  allAccounts = data.accounts || [];
+  updateCards();
+  applyDisplay();
+  renderIsps(data.isps);
+}
+
+// ---- Update donut cards ----
+function updateCards() {
+  const total   = allAccounts.length;
+  const online  = allAccounts.filter(a=>a.status==='online').length;
+  const offline = allAccounts.filter(a=>a.status==='offline').length;
+
+  // Live card — true current counts, so the donut always adds up to total
+  document.getElementById('dn-live').textContent    = total;
+  document.getElementById('cn-live-on').textContent  = online;
+  document.getElementById('cn-live-off').textContent = offline;
+  drawDonut('svg-live', online, offline, total);
+
+  // Period cards
+  ['today','week','month','year'].forEach(p => {
+    const inP    = allAccounts.filter(a => a.lastLogout && inPeriod(a.lastLogout, p));
+    const pTotal = inP.length;
+    const pDown  = inP.filter(a=>a.status==='offline').length;
+    const pBack  = pTotal - pDown;
+
+    document.getElementById('dn-'+p).textContent       = pTotal;
+    document.getElementById('cn-'+p+'-off').textContent = pDown;
+    document.getElementById('cn-'+p+'-on').textContent  = pBack;
+    drawDonut('svg-'+p, pBack, pDown, pTotal);
+  });
+}
+
+// ---- Card selection ----
+function selectCard(id) {
+  selectedCard = id;
+  document.querySelectorAll('.dcard').forEach(c => c.classList.remove('selected'));
+  document.getElementById('card-'+id).classList.add('selected');
+
+  const isLive = id === 'live';
+  document.getElementById('filt-btns').style.display = isLive ? '' : 'none';
+  document.getElementById('filt-div').style.display  = isLive ? '' : 'none';
+
+  const labels = { live:'All Accounts — Live', today:"Today's Outages", week:"This Week's Outages", month:"This Month's Outages", year:"This Year's Outages" };
+  document.getElementById('table-section-title').textContent = labels[id] || id;
+
+  if (!isLive) document.getElementById('sort-select').value = 'offline-recent';
+  applyDisplay();
+}
+
+// ---- View switching (sidebar) ----
+function setView(v) {
+  currentView = v;
+  document.getElementById('view-dashboard').style.display = v==='dashboard' ? '' : 'none';
+  document.getElementById('snav-dash').classList.toggle('active',  v==='dashboard');
+  document.getElementById('snav-table').classList.toggle('active', v==='table');
+  if (v==='table') { document.getElementById('filt-btns').style.display=''; document.getElementById('filt-div').style.display=''; }
+}
+
+// ---- Filter ----
+function setFilter(f) {
+  currentFilter = f;
+  ['all','online','offline'].forEach(id => document.getElementById('btn-'+id).classList.toggle('active', id===f));
+  applyDisplay();
+}
+
+// ---- Sort ----
+function setSort(val) { document.getElementById('sort-select').value=val; applyDisplay(); }
+
+const ARROW_CFG = {
+  'offline-recent':{col:'logout',  dir:'▼'},
+  'offline-oldest':{col:'logout',  dir:'▲'},
+  'status-az':     {col:'status',  dir:'▲'},
+  'username-az':   {col:'username',dir:'▲'},
+  'username-za':   {col:'username',dir:'▼'},
+  'lastseen-desc': {col:'lastseen',dir:'▼'},
+  'customer-az':   {col:'customer',dir:'▲'},
+  'flaps-desc':    {col:'flaps',   dir:'▼'},
+  'uptime-desc':   {col:'uptime',  dir:'▼'},
+  'uptime-asc':    {col:'uptime',  dir:'▲'},
+};
+function updateArrows(v) {
+  ['status','username','customer','lastseen','logout','flaps','uptime'].forEach(c => {
+    const el=document.getElementById('arr-'+c); el.textContent=''; el.parentElement.classList.remove('sorted');
+  });
+  const cfg=ARROW_CFG[v];
+  if(cfg){ const el=document.getElementById('arr-'+cfg.col); el.textContent=cfg.dir; el.parentElement.classList.add('sorted'); }
+}
+
+function sortAccounts(list, v) {
+  const ts = i => i ? new Date(i).getTime() : 0;
+  const c  = [...list];
+  switch(v) {
+    case 'offline-recent': return c.sort((a,b)=>{ if(a.status!==b.status) return a.status==='offline'?-1:1; if(a.status==='offline') return ts(b.lastLogout)-ts(a.lastLogout); return a.username.localeCompare(b.username); });
+    case 'offline-oldest': return c.sort((a,b)=>{ if(a.status!==b.status) return a.status==='offline'?-1:1; if(a.status==='offline') return ts(a.lastLogout)-ts(b.lastLogout); return a.username.localeCompare(b.username); });
+    case 'status-az':      return c.sort((a,b)=> a.status!==b.status?a.status.localeCompare(b.status):a.username.localeCompare(b.username));
+    case 'username-az':    return c.sort((a,b)=> a.username.localeCompare(b.username));
+    case 'username-za':    return c.sort((a,b)=> b.username.localeCompare(a.username));
+    case 'lastseen-desc':  return c.sort((a,b)=> ts(b.lastSeen)-ts(a.lastSeen));
+    case 'customer-az':    return c.sort((a,b)=> (a.customerName||'').localeCompare(b.customerName||''));
+    case 'flaps-desc':     return c.sort((a,b)=> (b.flapCount||0)-(a.flapCount||0));
+    // Offline accounts have no session uptime — keep them at the bottom of
+    // both directions rather than letting them masquerade as "0 seconds".
+    case 'uptime-desc':    return c.sort((a,b)=>{ const x=a.uptimeSec,y=b.uptimeSec; if(x==null&&y==null) return a.username.localeCompare(b.username); if(x==null) return 1; if(y==null) return -1; return y-x; });
+    case 'uptime-asc':     return c.sort((a,b)=>{ const x=a.uptimeSec,y=b.uptimeSec; if(x==null&&y==null) return a.username.localeCompare(b.username); if(x==null) return 1; if(y==null) return -1; return x-y; });
+    default: return c;
+  }
+}
+
+// ---- Main display ----
+function applyDisplay() {
+  const q   = document.getElementById('search').value.toLowerCase();
+  const sv  = document.getElementById('sort-select').value;
+  updateArrows(sv);
+
+  let list;
+
+  const matchesQuery = a => !q
+    || a.username.toLowerCase().includes(q)
+    || (a.comment||'').toLowerCase().includes(q)
+    || (a.remoteIp||'').includes(q)
+    || (a.profile||'').toLowerCase().includes(q)
+    || (a.customerName||'').toLowerCase().includes(q)
+    || (a.accountNo||'').toLowerCase().includes(q)
+    || (a.contactNo||'').toLowerCase().includes(q)
+    || (a.area||'').toLowerCase().includes(q)
+    || (a.napBox||'').toLowerCase().includes(q);
+
+  if (selectedCard === 'live' || currentView === 'table') {
+    list = allAccounts.filter(a => {
+      const mf = currentFilter==='all' || a.status===currentFilter;
+      return mf && matchesQuery(a);
+    });
+    list = sortAccounts(list, sv);
+  } else {
+    list = allAccounts.filter(a => {
+      const inP = a.lastLogout && inPeriod(a.lastLogout, selectedCard);
+      return inP && matchesQuery(a);
+    });
+    list = list.sort((a,b) => { const ts=i=>i?new Date(i).getTime():0; return ts(b.lastLogout)-ts(a.lastLogout); });
+    if (sv !== 'offline-recent') list = sortAccounts(list, sv);
+  }
+
+  const tbody = document.getElementById('tbody');
+  const nr    = document.getElementById('no-results');
+
+  if (list.length === 0) {
+    tbody.innerHTML = '';
+    nr.textContent  = selectedCard==='live' ? 'No accounts match your filter.' : 'No outages recorded for this period.';
+    return;
+  }
+  nr.textContent = '';
+
+  tbody.innerHTML = list.map(a => {
+    const src = a.lastLogout
+      ? \`\${fmt(a.lastLogout)} <span class="src-tag \${a.logSource||'poll'}">\${a.logSource==='secret'?'SECRET':'POLL'}</span>\`
+      : '—';
+    return \`<tr class="\${selectedCard==='live' && a.status==='offline' ? 'new-offline' : ''}">
+      <td><span class="badge \${a.status}">\${a.status}</span></td>
+      <td class="bold mono">\${esc(a.username)}</td>
+      <td style="font-size:12px">\${esc(a.customerName)||'—'}</td>
+      <td class="mono" style="color:var(--dim);font-size:12px">\${esc(a.accountNo)||'—'}</td>
+      <td class="mono" style="color:var(--dim);font-size:12px">\${esc(a.contactNo)||'—'}</td>
+      <td style="color:var(--dim);font-size:12px">\${esc(a.area)||'—'}</td>
+      <td style="color:var(--dim);font-size:12px">\${esc(a.napBox)||'—'}</td>
+      <td style="color:var(--dim);font-size:12px">\${esc(a.profile)||'—'}</td>
+      <td class="mono" style="color:var(--dim);font-size:12px">\${esc(a.remoteIp)||'—'}</td>
+      <td style="color:var(--dim);font-size:12px">\${esc(a.comment)||'—'}</td>
+      <td class="mono" style="color:\${a.uptime?'var(--green)':'var(--dim)'};font-size:12px">\${esc(a.uptime)||'—'}</td>
+      <td style="color:var(--dim);font-size:12px">\${fmt(a.lastSeen)}</td>
+      <td style="font-size:12px">\${src}</td>
+      <td class="mono" style="color:\${a.flapCount>=3?'var(--red)':'var(--dim)'};font-size:12px">\${a.flapCount||0}</td>
+    </tr>\`;
+  }).join('');
+}
+</script>
+</body>
+</html>`;
+}
+
+// ---------- customer lookup for the ticketing system ----------
+
+// napBox arrives from billing as "NAP / PORT" (e.g. "NAP-BRGY1-014 / 5").
+// The box name alone is what groups neighbours together.
+function napNameOf(napBox) {
+  const s = String(napBox || '').trim();
+  if (!s) return '';
+  const i = s.indexOf(' / ');
+  return (i === -1 ? s : s.slice(0, i)).trim();
+}
+
+// Only the fields a ticket needs — no router internals.
+function publicAccount(a) {
+  return {
+    username:     a.username,
+    accountNo:    a.accountNo || '',
+    customerName: a.customerName || '',
+    contactNo:    a.contactNo || '',
+    area:         a.area || '',
+    napBox:       a.napBox || '',
+    napName:      napNameOf(a.napBox),
+    status:       a.status,
+    uptime:       a.uptime || '',
+    lastSeen:     a.lastSeen || null,
+    lastLogout:   a.lastLogout || null,
+  };
+}
+
+/* The question a technician actually needs answered before riding out: is this
+   one subscriber's drop wire, or is the whole NAP dark? */
+function napContext(napName) {
+  if (!napName) return null;
+  const peers = state.accounts.filter(a => napNameOf(a.napBox) === napName);
+  if (!peers.length) return null;
+  const offline = peers.filter(a => a.status === 'offline');
+  return {
+    napName,
+    total:   peers.length,
+    offline: offline.length,
+    online:  peers.length - offline.length,
+    offlineUsernames: offline.map(a => a.username),
+    // Every subscriber on the box down at once points upstream of the box.
+    wholeNapDown: peers.length > 1 && offline.length === peers.length,
+  };
+}
+
+function matchesQuery(a, q) {
+  if (!q) return true;
+  return [a.username, a.customerName, a.accountNo, a.contactNo, a.area, a.napBox]
+    .some(v => String(v || '').toLowerCase().includes(q));
+}
+
+// Constant-time compare so the shared key can't be probed byte by byte.
+function keyMatches(supplied) {
+  const crypto = require('crypto');
+  const a = Buffer.from(String(supplied || ''));
+  const b = Buffer.from(API_TOKEN);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+// ---------- dashboard auth ----------
+
+function sessionToken() {
+  const crypto = require('crypto');
+  return crypto.createHmac('sha256', SESSION_SECRET).update('starline-monitor-v1').digest('hex');
+}
+
+function cookieOf(req, name) {
+  const raw = req.headers.cookie || '';
+  for (const part of raw.split(';')) {
+    const i = part.indexOf('=');
+    if (i === -1) continue;
+    if (part.slice(0, i).trim() === name) return part.slice(i + 1).trim();
+  }
+  return '';
+}
+
+/* A signed cookie (browser) or the service key (ticketing system). Fails closed:
+   with no DASHBOARD_PASSWORD set, nothing is served rather than everything. */
+function authed(req) {
+  const u = new URL(req.url, 'http://x');
+  if (API_TOKEN && keyMatches(req.headers['x-api-key'] || u.searchParams.get('key'))) return true;
+  if (!DASHBOARD_PASSWORD) return false;
+  const supplied = Buffer.from(cookieOf(req, 'sl_monitor'));
+  const expected = Buffer.from(sessionToken());
+  return supplied.length === expected.length &&
+    require('crypto').timingSafeEqual(supplied, expected);
+}
+
+function loginPage(message) {
+  return `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>StarLine Monitor</title>
+<style>body{background:#0b1220;color:#e2e8f0;font-family:-apple-system,Segoe UI,Roboto,sans-serif;display:flex;
+min-height:100vh;align-items:center;justify-content:center;margin:0}
+form{background:#111c31;padding:26px;border-radius:14px;width:300px;box-shadow:0 10px 40px rgba(0,0,0,.45)}
+h1{font-size:17px;margin:0 0 4px}p{font-size:12.5px;color:#93a4bd;margin:0 0 16px}
+input{width:100%;padding:11px;border-radius:9px;border:1px solid #27374f;background:#0b1220;color:#e2e8f0;
+font-size:15px;box-sizing:border-box}
+button{width:100%;margin-top:12px;padding:11px;border:0;border-radius:9px;background:#f2c230;color:#0b1220;
+font-weight:700;font-size:15px;cursor:pointer}
+.err{color:#fca5a5;font-size:12.5px;margin-top:10px}</style>
+<form method="POST" action="/login">
+  <h1>StarLine PPPoE Monitor</h1>
+  <p>Subscriber data — sign in to continue.</p>
+  <input type="password" name="password" placeholder="Password" autofocus autocomplete="current-password">
+  <button type="submit">Sign in</button>
+  ${message ? `<div class="err">${message}</div>` : ''}
+</form>`;
+}
+
+// ---------- HTTP Server ----------
+
+/* The handler is async because the billing write is. An async handler that
+   rejects is an unhandled rejection, which in Node 22 takes the process down —
+   so nothing may escape this wrapper. Monitoring staying up matters more than
+   any single request. */
+const server = http.createServer((req, res) => {
+  handleRequest(req, res).catch(err => {
+    console.error('[http] request failed:', err && err.message);
+    if (!res.headersSent) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'request failed' }));
+    } else {
+      try { res.end(); } catch (_) {}
+    }
+  });
+});
+
+async function handleRequest(req, res) {
+  const path = req.url.split('?')[0];
+
+  /* ---- sign in ---- */
+  if (path === '/login' && req.method === 'POST') {
+    let body = '';
+    req.on('data', c => { body += c; if (body.length > 4096) req.destroy(); });
+    req.on('end', () => {
+      const supplied = decodeURIComponent(
+        (new URLSearchParams(body).get('password') || '').replace(/\+/g, ' '));
+      if (!DASHBOARD_PASSWORD) {
+        res.writeHead(503, { 'Content-Type': 'text/html' });
+        return res.end(loginPage('DASHBOARD_PASSWORD is not set on this service.'));
+      }
+      const a = Buffer.from(supplied), b = Buffer.from(DASHBOARD_PASSWORD);
+      const ok = a.length === b.length && require('crypto').timingSafeEqual(a, b);
+      if (!ok) {
+        res.writeHead(401, { 'Content-Type': 'text/html' });
+        return res.end(loginPage('Wrong password.'));
+      }
+      res.writeHead(302, {
+        'Set-Cookie': `sl_monitor=${sessionToken()}; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000${
+          req.headers['x-forwarded-proto'] === 'https' ? '; Secure' : ''}`,
+        Location: '/',
+      });
+      res.end();
+    });
+    return;
+  }
+  if (path === '/login') {
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    return res.end(loginPage(''));
+  }
+  if (path === '/logout') {
+    res.writeHead(302, { 'Set-Cookie': 'sl_monitor=; Path=/; Max-Age=0', Location: '/login' });
+    return res.end();
+  }
+
+  /* ---- everything past here is subscriber data ---- */
+  if (!authed(req)) {
+    if (path.startsWith('/api/') || path === '/events') {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: 'Not signed in' }));
+    }
+    res.writeHead(401, { 'Content-Type': 'text/html' });
+    return res.end(loginPage(DASHBOARD_PASSWORD ? '' : 'DASHBOARD_PASSWORD is not set on this service.'));
+  }
+
+  if (req.url === '/events') {
+    res.writeHead(200, {
+      'Content-Type':  'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection':    'keep-alive',
+    });
+    res.flushHeaders();
+    res.write(`data: ${JSON.stringify(state)}\n\n`);
+    sseClients.add(res);
+    req.on('close', () => sseClients.delete(res));
+    return;
+  }
+
+  if (req.url === '/api/state') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(state));
+    return;
+  }
+
+  // Debug: view raw ISP ping results
+  // Open http://localhost:3000/api/isps in your browser to inspect
+  if (req.url === '/api/isps') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(state.isps, null, 2));
+    return;
+  }
+
+  /* ---- NAP / area list (service-to-service; feeds the FTTH map's Area picker) ----
+     GET /api/naps  -> every distinct NAP box and area code billing knows about,
+                       with how many subscribers sit on each and how many are down.
+     Counts only — no names or contact numbers, because this only fills a dropdown. */
+  /* The catalogues billing owns — areas and plans — so the ticketing app never
+     keeps its own copy that can drift out of date. */
+  if (path === '/api/billing-catalog') {
+    const send = (code, body) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(body)); };
+    if (!BILLING_ENABLED) return send(503, { error: 'Billing is not configured on this service.' });
+    try {
+      const c = await billingCatalog();
+      return send(200, { areas: c.areas, products: c.products });
+    } catch (e) {
+      return send(502, { error: describeFetchError(e) });
+    }
+  }
+
+  /* The write. Service key only — never a dashboard cookie, because this one
+     changes what a subscriber is charged and ends by texting them. */
+  if (path === '/api/billing-push') {
+    const send = (code, body) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(body)); };
+    if (req.method !== 'POST') return send(405, { error: 'POST only' });
+    if (!API_TOKEN || !keyMatches(req.headers['x-api-key'] || '')) {
+      return send(401, { error: 'Not authorised' });
+    }
+    if (!BILLING_ENABLED) return send(503, { error: 'Billing is not configured on this service.' });
+    let body = '';
+    try {
+      await new Promise((resolve, reject) => {
+        req.on('data', c => { body += c; if (body.length > 64 * 1024) { req.destroy(); reject(new Error('payload too large')); } });
+        req.on('end', resolve);
+        req.on('error', reject);
+      });
+      const input = JSON.parse(body || '{}');
+      if (!String(input.username || '').trim()) return send(400, { error: 'username (the PPPoE account) is required' });
+      const out = await billingPush(input);
+      return send(out.ok ? 200 : 502, out);
+    } catch (e) {
+      logPush({ username: (() => { try { return JSON.parse(body || '{}').username; } catch (_) { return ''; } })(), ok: false, error: e.message });
+      return send(502, { ok: false, error: e.message });
+    }
+  }
+
+  /* What the pushes did, so a failure with nobody watching is still findable. */
+  /* A newly installed NAP box, registered as an Area so subscribers can be
+     filed under it straight away. Idempotent: an area billing already has is
+     reported, not added twice. */
+  if (path === '/api/billing-area') {
+    const send = (code, body) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(body)); };
+    if (req.method !== 'POST') return send(405, { error: 'POST only' });
+    if (!API_TOKEN || !keyMatches(req.headers['x-api-key'] || '')) {
+      return send(401, { error: 'Not authorised' });
+    }
+    if (!BILLING_ENABLED) return send(503, { error: 'Billing is not configured on this service.' });
+    let body = '';
+    try {
+      await new Promise((resolve, reject) => {
+        req.on('data', c => { body += c; if (body.length > 16 * 1024) { req.destroy(); reject(new Error('payload too large')); } });
+        req.on('end', resolve);
+        req.on('error', reject);
+      });
+      const input = JSON.parse(body || '{}');
+      const out = await billingAddArea(input.area);
+      logPush({ area: String(input.area || ''), ok: out.ok, created: !!out.created, error: out.error || '' });
+      return send(out.ok ? 200 : 502, out);
+    } catch (e) {
+      logPush({ area: '', ok: false, error: e.message });
+      return send(502, { ok: false, created: false, error: describeFetchError(e) });
+    }
+  }
+
+  /* Cut-over helper: copy every Area TaokiNinam knows into the new billing app.
+     Needs both sets of credentials, so run it before TaokiNinam is switched off.
+     Idempotent — areas the new billing already has are reported, not duplicated. */
+  if (path === '/api/billing-copy-areas') {
+    const send = (code, body) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(body)); };
+    if (req.method !== 'POST') return send(405, { error: 'POST only' });
+    if (!API_TOKEN || !keyMatches(req.headers['x-api-key'] || '')) return send(401, { error: 'Not authorised' });
+    if (!OLD_BILLING_ENABLED || !NEW_BILLING_READY) return send(503, { error: 'Needs TAOKININAM_USERNAME/PASSWORD and NEW_BILLING_URL/NEW_BILLING_KEY.' });
+    try {
+      const addHtml = await billingGet('/addRecord.php');
+      const areas = parseSelectOptions(addHtml, 'area').map(o => o.value).filter(v => v && !/^select /i.test(v));
+      const results = [];
+      for (const a of areas) {
+        const r = await newBillingFetch('/api/areas', { method: 'POST', body: { area: a }, passThrough: true });
+        results.push({ area: a, ok: !!(r.body && r.body.ok), created: !!(r.body && r.body.created) });
+      }
+      return send(200, { found: areas.length, created: results.filter(r => r.created).length, results });
+    } catch (e) {
+      return send(502, { error: describeFetchError(e) });
+    }
+  }
+
+  /* Repair with a re-used modem: the PPPoE account inside the replacement modem moves to the
+     subscriber being repaired (new billing only). Service key only. */
+  if (path === '/api/billing-modem-swap') {
+    const send = (code, body) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(body)); };
+    if (req.method !== 'POST') return send(405, { error: 'POST only' });
+    if (!API_TOKEN || !keyMatches(req.headers['x-api-key'] || '')) return send(401, { error: 'Not authorised' });
+    if (!USE_NEW_BILLING) return send(503, { ok: false, error: 'Modem swaps are recorded automatically only after the cut-over to the new billing. For now, update the old billing by hand.' });
+    let body = '';
+    try {
+      await new Promise((resolve, reject) => {
+        req.on('data', c => { body += c; if (body.length > 16 * 1024) { req.destroy(); reject(new Error('payload too large')); } });
+        req.on('end', resolve); req.on('error', reject);
+      });
+      const input = JSON.parse(body || '{}');
+      const r = await newBillingFetch('/api/modem-swap', { method: 'POST', body: input, passThrough: true, timeout: 60000 });
+      const out = Object.assign({ ok: false, steps: [] }, r.body || {});
+      logPush({ username: input.newUsername, swapFor: input.customer, ok: !!out.ok, steps: out.steps, error: out.error || '' });
+      return send(out.ok ? 200 : 502, out);
+    } catch (e) {
+      return send(502, { ok: false, error: describeFetchError(e) });
+    }
+  }
+
+  /* Is this PPPoE account free to put in another modem? (new billing only) */
+  if (path.startsWith('/api/billing-pppoe-status/')) {
+    const send = (code, body) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(body)); };
+    if (!API_TOKEN || !keyMatches(req.headers['x-api-key'] || '')) return send(401, { error: 'Not authorised' });
+    if (!USE_NEW_BILLING) return send(200, { state: 'unknown' });
+    try {
+      const u = decodeURIComponent(path.slice('/api/billing-pppoe-status/'.length));
+      const r = await newBillingFetch('/api/pppoe-status/' + encodeURIComponent(u), { passThrough: true });
+      return send(200, r.body || { state: 'unknown' });
+    } catch (e) {
+      return send(200, { state: 'unknown', error: describeFetchError(e) });
+    }
+  }
+
+  if (path === '/api/billing-pushlog') {
+    const send = (code, body) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(body)); };
+    return send(200, { pushes: billingPushLog.slice(-200).reverse() });
+  }
+
+  if (path === '/api/naps') {
+    const send = (code, body) => {
+      res.writeHead(code, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(body));
+    };
+    if (!state.lastPoll) {
+      return send(503, { error: 'Monitor has not completed its first poll yet — try again shortly.' });
+    }
+
+    /* One pass over the accounts, grouped both ways: the FTTH map can key on
+       whichever column this billing export actually maintains. */
+    const byNap = new Map();
+    const byArea = new Map();
+    const bump = (map, key, account, partnerKey, partnerField) => {
+      if (!key) return;
+      if (!map.has(key)) map.set(key, { customers: 0, offline: 0, partners: new Set() });
+      const row = map.get(key);
+      row.customers += 1;
+      if (account.status === 'offline') row.offline += 1;
+      if (partnerKey) row.partners.add(partnerKey);
+    };
+
+    for (const a of state.accounts) {
+      const napName = napNameOf(a.napBox);
+      const area = String(a.area || '').trim();
+      bump(byNap, napName, a, area);
+      bump(byArea, area, a, napName);
+    }
+
+    const shape = (map, keyName, partnerName) =>
+      [...map.entries()]
+        .map(([key, v]) => ({
+          [keyName]: key,
+          [partnerName]: [...v.partners].sort(),
+          customers: v.customers,
+          online: v.customers - v.offline,
+          offline: v.offline,
+          wholeGroupDown: v.customers > 1 && v.offline === v.customers,
+        }))
+        .sort((x, y) => String(x[keyName]).localeCompare(String(y[keyName])));
+
+    return send(200, {
+      naps:  shape(byNap, 'napName', 'areas'),
+      areas: shape(byArea, 'area', 'napNames'),
+      meta: {
+        billingLastSync: state.billingLastSync,
+        billingError:    state.billingError,
+        lastPoll:        state.lastPoll,
+      },
+    });
+  }
+
+  /* ---- customer lookup (service-to-service; used by the ticketing system) ----
+     GET /api/customers?q=dela+cruz        -> matching customers, live status included
+     GET /api/customers/<pppoe-username>   -> one customer plus their NAP's context
+     Auth: X-Api-Key header (or ?key= for quick manual checks). */
+  if (req.url.startsWith('/api/customers')) {
+    const u = new URL(req.url, 'http://x');
+    const send = (code, body) => {
+      res.writeHead(code, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(body));
+    };
+
+    if (!API_TOKEN) {
+      return send(503, { error: 'Customer lookup is disabled: set API_TOKEN on this service to enable it.' });
+    }
+    if (!keyMatches(req.headers['x-api-key'] || u.searchParams.get('key'))) {
+      return send(401, { error: 'Bad or missing API key' });
+    }
+    if (!state.lastPoll) {
+      return send(503, { error: 'Monitor has not completed its first poll yet — try again shortly.' });
+    }
+
+    const rest = u.pathname.slice('/api/customers'.length).replace(/^\//, '');
+    const meta = {
+      billingLastSync: state.billingLastSync,
+      billingError:    state.billingError,
+      lastPoll:        state.lastPoll,
+    };
+
+    if (rest) {
+      const username = decodeURIComponent(rest).toLowerCase();
+      const found = state.accounts.find(a => String(a.username || '').toLowerCase() === username);
+      if (!found) return send(404, { error: 'No PPPoE account by that username', username });
+      const customer = publicAccount(found);
+      return send(200, { customer, nap: napContext(customer.napName), meta });
+    }
+
+    const q = String(u.searchParams.get('q') || '').trim().toLowerCase();
+    const limit = Math.min(Math.max(parseInt(u.searchParams.get('limit') || '25', 10) || 25, 1), 100);
+    const all = state.accounts.filter(a => matchesQuery(a, q));
+    return send(200, {
+      count: all.length,
+      truncated: all.length > limit,
+      customers: all.slice(0, limit).map(publicAccount),
+      meta,
+    });
+  }
+
+  res.writeHead(200, { 'Content-Type': 'text/html' });
+  res.end(dashboardHtml());
+}
+
+server.listen(DASHBOARD_PORT, () => {
+  console.log(`
+╔══════════════════════════════════════════════╗
+║         StarLine PPPoE Monitor               ║
+╠══════════════════════════════════════════════╣
+║  Dashboard    →  http://localhost:${DASHBOARD_PORT}      ║
+║  Router (SSH) →  ${SSH_HOST}:${SSH_PORT}
+║  Polling every ${Math.round(POLL_INTERVAL_MS/1000)}s                          ║
+║  Alert when ${ALERT_THRESHOLD}+ accounts offline              ║
+╚══════════════════════════════════════════════╝
+
+Status comes directly from the router (/ppp active, /ppp secret) over SSH.
+Billing enrichment (customer name/account/contact/area/NAP): ${USE_NEW_BILLING ? 'ON — StarLine billing app ' + NEW_BILLING_URL : BILLING_ENABLED ? 'ON — ' + BILLING_BASE_URL : 'OFF (TAOKININAM_USERNAME/PASSWORD not set)'}
+
+Offline time source:
+  [SECRET] = the PPP secret's own "last logged out" field (same value
+             shown in Winbox under PPP > Secrets > Last Logged Out)
+  [POLL]   = fallback — first poll where monitor.js itself saw the
+             account go offline (only used if that field is empty)
+`);
+  pollRouter();
+  setInterval(pollRouter, POLL_INTERVAL_MS);
+  pollIsps();
+  setInterval(pollIsps, POLL_INTERVAL_MS);
+});
