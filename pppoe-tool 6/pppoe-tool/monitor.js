@@ -1188,34 +1188,59 @@ function broadcast() {
 
 // ---------- Dashboard HTML ----------
 
-function dashboardHtml() {
+function dashboardHtml(user) {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>StarLine Internet Customer Uptime Monitor</title>
+<title>StarLine Internet · Uptime Monitor</title>
+<link rel="icon" type="image/png" href="/icon.png">
+<meta name="theme-color" content="#12304a">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
+/* StarLine Internet brand — same as the ticketing app, FTTH map, pay page and portal */
 :root {
-  --bg:       #0e1018;
-  --sidebar:  #13151f;
-  --card:     #181b28;
-  --card2:    #1e2130;
-  --border:   #252840;
-  --green:    #8dc63f;
-  --red:      #e84040;
-  --amber:    #f59e0b;
-  --blue:     #4a8fd4;
-  --purple:   #9b59b6;
-  --text:     #c8d0e0;
-  --dim:      #48506a;
-  --accent:   #4f6ef7;
-  --isp-up:     #38bdf8;
-  --isp-down:   #fb923c;
-  --isp-accent: #818cf8;
+  --navy:     #12304a;
+  --navy2:    #1b4166;
+  --gold:     #d9b345;
+  --bg:       #f3f5f8;
+  --sidebar:  #12304a;
+  --card:     #ffffff;
+  --card2:    #f6f8fb;
+  --border:   #e5e7eb;
+  --green:    #16a34a;
+  --red:      #dc2626;
+  --amber:    #d97706;
+  --blue:     #2563eb;
+  --purple:   #7c3aed;
+  --text:     #1f2937;
+  --dim:      #6b7280;
+  --accent:   #12304a;
+  --isp-up:     #16a34a;
+  --isp-down:   #ea580c;
+  --isp-accent: #6366f1;
 }
 * { box-sizing: border-box; margin:0; padding:0; }
-body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text); min-height:100vh; display:flex; flex-direction:column; }
+body { font-family: Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; background: var(--bg); color: var(--text); min-height:100vh; display:flex; flex-direction:column; -webkit-font-smoothing: antialiased; }
+
+/* ---- StarLine header ---- */
+.brandbar {
+  background: var(--navy); border-bottom: 3px solid var(--gold); color:#fff;
+  padding: 10px 16px; display:flex; align-items:center; gap:12px; flex-shrink:0;
+}
+.brandbar .bl { height:40px; width:auto; flex-shrink:0; }
+.brandbar .bt { border-left:1px solid rgba(255,255,255,.3); padding-left:12px; min-width:0; }
+.brandbar .bt h1 { font-size:13px; font-weight:600; color:#e6ebf2; letter-spacing:.04em; text-transform:uppercase; white-space:nowrap; }
+.brandbar .bt .bs { font-size:12px; color:#c7d2e1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.brandbar .sp { flex:1; }
+.brandbar .who { font-size:12.5px; color:#e6ebf2; white-space:nowrap; }
+.brandbar .hb { color:#fff; border:1px solid rgba(255,255,255,.35); border-radius:6px; padding:6px 12px; font-size:12.5px; font-weight:600; text-decoration:none; white-space:nowrap; }
+.brandbar .hb:hover { background:rgba(255,255,255,.1); }
+.chip { display:inline-block; font-size:10.5px; font-weight:700; padding:2px 7px; border-radius:99px; margin-left:4px; vertical-align:1px; }
+.chip.admin { background:var(--gold); color:#0b2236; }
+.chip.technician { background:rgba(255,255,255,.2); color:#fff; }
 
 /* ---- Alert banner ---- */
 #alert-banner {
@@ -1224,7 +1249,7 @@ body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); co
   animation: abpulse 1.3s infinite; gap:14px; z-index:200; flex-shrink:0;
 }
 #alert-banner.active { display:flex; align-items:center; justify-content:center; }
-@keyframes abpulse { 0%,100%{background:#e84040} 50%{background:#7f1d1d} }
+@keyframes abpulse { 0%,100%{background:#dc2626} 50%{background:#991b1b} }
 #mute-btn { background:rgba(255,255,255,.15); border:1px solid rgba(255,255,255,.3); border-radius:5px; color:#fff; font-size:12px; padding:4px 12px; cursor:pointer; flex-shrink:0; }
 #mute-btn:hover { background:rgba(255,255,255,.25); }
 
@@ -1237,19 +1262,22 @@ body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); co
   display:flex; flex-direction:column; align-items:center; padding:12px 0; gap:4px;
   flex-shrink:0;
 }
+.sidebar { border-right:0; }
 .slogo {
-  font-size:20px; padding:10px 0 16px; border-bottom:1px solid var(--border);
+  padding:6px 0 12px; border-bottom:1px solid rgba(255,255,255,.15);
   width:100%; text-align:center; margin-bottom:8px;
 }
+.slogo svg { display:block; margin:0 auto; }
 .snav {
   width:44px; height:44px; border-radius:8px; display:flex; align-items:center; justify-content:center;
   font-size:18px; cursor:pointer; transition:background .15s; color:var(--dim); position:relative;
 }
-.snav:hover { background:var(--card2); color:var(--text); }
-.snav.active { background:var(--accent); color:#fff; }
+.snav { color:#9fb3c8; }
+.snav:hover { background:rgba(255,255,255,.1); color:#fff; }
+.snav.active { background:var(--gold); color:var(--navy); }
 .snav .stip {
-  position:absolute; left:54px; background:#1e2130; border:1px solid var(--border);
-  color:var(--text); font-size:11px; padding:4px 8px; border-radius:4px;
+  position:absolute; left:54px; background:var(--navy); border:1px solid var(--gold);
+  color:#fff; font-size:11px; padding:4px 8px; border-radius:4px;
   white-space:nowrap; display:none; pointer-events:none; z-index:100;
 }
 .snav:hover .stip { display:block; }
@@ -1262,9 +1290,10 @@ body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); co
   background:var(--card); border-bottom:1px solid var(--border);
   padding:14px 24px; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px;
 }
-.topbar h1 { font-size:17px; font-weight:700; color:#e8ecf5; display:flex; align-items:center; gap:8px; }
-.topbar .meta { font-size:11px; color:var(--dim); display:flex; gap:16px; flex-wrap:wrap; }
-.topbar .meta span strong { color:#8090a8; }
+.topbar { padding:10px 24px; }
+.topbar h1 { font-size:13px; font-weight:700; color:var(--navy); display:flex; align-items:center; gap:8px; text-transform:uppercase; letter-spacing:.06em; }
+.topbar .meta { font-size:11.5px; color:var(--dim); display:flex; gap:16px; flex-wrap:wrap; }
+.topbar .meta span strong { color:var(--text); }
 
 /* ---- Scrollable content ---- */
 .content { flex:1; overflow-y:auto; padding:20px 24px 32px; display:flex; flex-direction:column; gap:20px; }
@@ -1277,8 +1306,8 @@ body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); co
   margin-bottom: 4px;
 }
 .isp-card {
-  background: linear-gradient(150deg, #171b34, #1c2148);
-  border: 1px solid #2c3568; border-radius: 12px;
+  background: #fff;
+  border: 1px solid var(--border); border-radius: 12px; box-shadow: 0 1px 2px rgba(16,24,40,.04);
   padding: 16px 18px; position: relative; overflow: hidden;
   display: flex; flex-direction: column; gap: 8px;
 }
@@ -1297,13 +1326,13 @@ body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); co
 .isp-card[data-online="null"] .isp-status-dot  { background: var(--isp-accent); box-shadow: 0 0 6px var(--isp-accent); }
 .isp-status-label {
   font-size: 10px; font-weight: 700; letter-spacing: .6px;
-  color: #7dd3fc; text-transform: uppercase;
+  color: var(--isp-up); text-transform: uppercase;
 }
-.isp-card[data-online="false"] .isp-status-label { color: #fdba74; }
-.isp-card[data-online="null"]  .isp-status-label { color: #c7d2fe; }
-.isp-name { font-size: 14px; font-weight: 700; color: #e2e8f5; }
-.isp-plan { font-size: 11px; color: #8b93b8; }
-.isp-ip   { font-size: 11px; color: #7a85a0; font-family: monospace; }
+.isp-card[data-online="false"] .isp-status-label { color: var(--isp-down); }
+.isp-card[data-online="null"]  .isp-status-label { color: var(--isp-accent); }
+.isp-name { font-size: 14px; font-weight: 700; color: var(--text); }
+.isp-plan { font-size: 11px; color: var(--dim); }
+.isp-ip   { font-size: 11px; color: var(--dim); font-family: monospace; }
 .isp-latency { font-size: 13px; color: var(--isp-up); font-weight: 700; margin-top: auto; }
 .isp-card[data-online="false"] .isp-latency { color: var(--isp-down); }
 .isp-card[data-online="null"]  .isp-latency { color: var(--isp-accent); }
@@ -1335,10 +1364,10 @@ body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); co
 }
 .lc-label {
   font-size: 13px; font-weight: 700; text-transform: uppercase;
-  letter-spacing: .7px; color: #e2e8f5;
+  letter-spacing: .7px; color: var(--navy);
 }
 .lc-sub {
-  font-size: 12px; color: #7a85a0; margin-top: 3px;
+  font-size: 12px; color: var(--dim); margin-top: 3px;
 }
 .lc-donut-wrap { position: relative; margin-bottom: 28px; }
 .lc-donut-wrap svg { display: block; }
@@ -1353,7 +1382,7 @@ body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); co
 .lc-stat-n  { font-size: 32px; font-weight: 700; line-height: 1; }
 .lc-stat-n.green { color: var(--green); }
 .lc-stat-n.red   { color: var(--red); }
-.lc-stat-l  { font-size: 12px; color: #9aa8c0; margin-top: 5px; text-transform: uppercase; letter-spacing: .4px; }
+.lc-stat-l  { font-size: 12px; color: var(--dim); margin-top: 5px; text-transform: uppercase; letter-spacing: .4px; }
 
 /* Right 2×2 history grid */
 .history-grid {
@@ -1376,7 +1405,7 @@ body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); co
   content:''; position:absolute; left:0; top:0; bottom:0; width:3px;
   background: var(--accent); border-radius: 10px 0 0 10px;
 }
-.dcard-title { font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: .7px; color: #e2e8f5; margin-bottom: 14px; }
+.dcard-title { font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: .7px; color: var(--navy); margin-bottom: 14px; }
 .dcard-body  { display: flex; align-items: center; gap: 16px; flex: 1; }
 
 /* Donut (history cards) */
@@ -1395,11 +1424,11 @@ body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); co
 .count-dot.green { background: var(--green); box-shadow: 0 0 5px var(--green)44; }
 .count-dot.red   { background: var(--red); }
 .count-num   { font-size: 22px; font-weight: 700; line-height: 1; min-width: 36px; }
-.count-label { color: #9aa8c0; font-size: 12px; font-weight: 500; }
+.count-label { color: var(--dim); font-size: 12px; font-weight: 500; }
 
 /* ---- Section header ---- */
 .section-header { display:flex; align-items:center; gap:12px; margin-bottom:2px; }
-.section-title  { font-size:13px; font-weight:600; color:#8090a8; text-transform:uppercase; letter-spacing:.5px; }
+.section-title  { font-size:12px; font-weight:700; color:var(--navy); text-transform:uppercase; letter-spacing:.12em; }
 .section-line   { flex:1; height:1px; background:var(--border); }
 
 /* ---- Toolbar ---- */
@@ -1432,33 +1461,52 @@ thead th {
   border-bottom:1px solid var(--border); cursor:pointer; user-select:none; white-space:nowrap;
   background:var(--card);
 }
-thead th:hover { color:#8090a8; }
+thead th:hover { color:var(--navy); }
 thead th .arr { margin-left:3px; opacity:.3; }
 thead th.sorted .arr { opacity:1; color:var(--accent); }
-tbody tr { border-bottom:1px solid #151720; transition:background .1s; }
+tbody tr { border-bottom:1px solid var(--border); transition:background .1s; }
 tbody tr:hover { background:var(--card2); }
 tbody tr.new-offline { animation:rowpop 2.5s ease-out forwards; }
-@keyframes rowpop { 0%{background:#7f1d1d44} 100%{background:transparent} }
-tbody td { padding:9px 12px; color:#9aa3bc; vertical-align:middle; }
+@keyframes rowpop { 0%{background:#fecaca} 100%{background:transparent} }
+tbody td { padding:9px 12px; color:#374151; vertical-align:middle; }
 
 /* Status badges */
 .badge { display:inline-flex; align-items:center; gap:5px; padding:3px 9px; border-radius:20px; font-size:11px; font-weight:600; }
 .badge::before { content:''; width:6px; height:6px; border-radius:50%; }
-.badge.online  { background:#14532d33; color:#4ade80; border:1px solid #166534; }
-.badge.offline { background:#7f1d1d33; color:#f87171; border:1px solid #991b1b; }
+.badge.online  { background:#dcfce7; color:#166534; border:1px solid #86efac; }
+.badge.offline { background:#fee2e2; color:#991b1b; border:1px solid #fecaca; }
 .badge.online::before  { background:var(--green); box-shadow:0 0 4px var(--green); }
 .badge.offline::before { background:var(--red); }
 
 .src-tag { display:inline-block; font-size:9px; padding:1px 5px; border-radius:3px; margin-left:5px; font-weight:600; vertical-align:middle; }
-.src-tag.secret { background:#1e3a5f; color:#60a5fa; border:1px solid #1e40af; }
-.src-tag.poll   { background:#2d2a1e; color:#fbbf24; border:1px solid #78350f; }
+.src-tag.secret { background:#e0ecff; color:#1e40af; border:1px solid #9cc1f5; }
+.src-tag.poll   { background:#fef9c3; color:#a16207; border:1px solid #fde047; }
 
 .mono  { font-family:monospace; font-size:12px; }
-.bold  { font-weight:600; color:#c8d0e0; }
+.bold  { font-weight:600; color:var(--text); }
 
-#error-bar { display:none; background:#7f1d1d; color:#fca5a5; padding:9px 24px; font-size:12px; }
+#error-bar { display:none; background:#fee2e2; color:#991b1b; padding:9px 24px; font-size:12px; border-bottom:1px solid #fecaca; }
 #error-bar.active { display:block; }
 #no-results { text-align:center; color:var(--dim); padding:36px; font-size:13px; }
+
+/* ---- FTTH map tab ---- */
+#ftth-map { height: calc(100vh - 230px); min-height: 380px; border: 1px solid var(--border); border-radius: 12px; background: #e5e9ef; }
+.map-meta { font-size: 11.5px; color: var(--dim); white-space: nowrap; }
+.map-tools { display:flex; flex-wrap:wrap; gap:6px 14px; align-items:center; margin: 8px 0 10px; font-size: 12px; color: var(--dim); }
+.map-tools .lg { display:inline-flex; align-items:center; gap:6px; }
+.map-tools .chk { cursor:pointer; color: var(--text); font-weight:600; }
+.map-tools i { display:inline-block; }
+.dv { width:12px; height:12px; border-radius:50%; border:2px solid #fff; box-shadow:0 0 0 1px rgba(0,0,0,.25); }
+.dv.nap { background:#2563eb; } .dv.olt { background:#d9b345; border-radius:3px; } .dv.spl { background:#7c3aed; }
+.hs { width:9px; height:9px; border-radius:50%; border:1.5px solid #fff; box-shadow:0 0 0 1px rgba(0,0,0,.25); }
+.hs.on { background:#16a34a; } .hs.off { background:#dc2626; } .hs.na { background:#94a3b8; }
+.ln { width:22px; height:3px; border-radius:2px; background:#3b82f6; } .ln.cut { background: repeating-linear-gradient(90deg,#dc2626 0 4px,transparent 4px 7px); }
+.map-note { font-size: 11.5px; color: var(--dim); margin-top: 8px; }
+.ftth-pin { border-radius:50%; border:2px solid #fff; box-shadow:0 1px 4px rgba(0,0,0,.45); }
+.ftth-pin.olt { border-radius:4px; }
+.ftth-lbl { position:absolute; top:14px; left:50%; transform:translateX(-50%); white-space:nowrap; font: 700 10.5px Inter, sans-serif; color:#0b2236;
+  text-shadow: 0 0 3px #fff, 0 0 3px #fff, 0 0 5px #fff; pointer-events:none; }
+.leaflet-container { font-family: Inter, sans-serif; }
 
 /* ---- Mobile ---- */
 @media (max-width: 900px) {
@@ -1473,11 +1521,16 @@ tbody td { padding:9px 12px; color:#9aa3bc; vertical-align:middle; }
   .topbar { padding: 10px 12px; }
   .topbar h1 { font-size: 14px; gap: 5px; }
   .topbar h1 span { display: none; }
+  .brandbar { flex-wrap: wrap; gap: 8px; padding: 8px 10px; }
+  .brandbar .bl { height: 32px; }
+  .brandbar .bt, .brandbar .who { display: none; }
+  .brandbar .hb { padding: 5px 9px; font-size: 12px; }
   .topbar .meta { font-size: 10px; gap: 8px 12px; }
   .content { padding: 12px 10px 24px; gap: 14px; }
   .isp-panel { grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; }
   .isp-card { padding: 12px 14px; }
   .history-grid { grid-template-columns: 1fr; grid-template-rows: none; gap: 10px; }
+  #ftth-map { height: calc(100vh - 260px); }
   .lc-donut-wrap svg { width: 140px; height: 140px; }
   .lc-stats { gap: 22px; }
   .lc-big-num { font-size: 36px; }
@@ -1492,6 +1545,13 @@ tbody td { padding:9px 12px; color:#9aa3bc; vertical-align:middle; }
 </head>
 <body>
 
+<header class="brandbar">
+  <img class="bl" src="/logo.png" alt="StarLine Internet">
+  <div class="bt"><h1>Uptime Monitor</h1><div class="bs">Customer connections &amp; ISP links</div></div>
+  <div class="sp"></div>
+  ${monitorAuth.userBarHtml(user)}
+</header>
+
 <div id="alert-banner">
   <span>⚠️ ALARM — <span id="al-count">0</span> subscribers went offline TODAY and are still down! Since: <span id="al-since">—</span></span>
   <button id="mute-btn" onclick="toggleMute()">🔇 Mute</button>
@@ -1501,12 +1561,16 @@ tbody td { padding:9px 12px; color:#9aa3bc; vertical-align:middle; }
 
   <!-- Sidebar -->
   <nav class="sidebar">
-    <div class="slogo">📡</div>
+    <div class="slogo"><svg viewBox="0 0 32 32" width="30" height="30" aria-label="StarLine"><path d="M16 3l3.4 7.7L28 11.6l-6.2 5.5 1.8 8.2L16 21.1 8.4 25.3l1.8-8.2L4 11.6l8.6-.9z" fill="#d9b345"/></svg></div>
     <div class="snav active" id="snav-dash" onclick="setView('dashboard')">
       ⊞ <span class="stip">Dashboard</span>
     </div>
     <div class="snav" id="snav-table" onclick="setView('table')">
       ☰ <span class="stip">Account List</span>
+    </div>
+    <div class="snav" id="snav-map" onclick="setView('map')">
+      <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 4 3 6v14l6-2 6 2 6-2V4l-6 2-6-2z"/><path d="M9 4v14M15 6v14"/></svg>
+      <span class="stip">FTTH Map</span>
     </div>
   </nav>
 
@@ -1516,7 +1580,7 @@ tbody td { padding:9px 12px; color:#9aa3bc; vertical-align:middle; }
 
     <!-- Top bar -->
     <div class="topbar">
-      <h1>📡 StarLine Internet Customer Uptime Monitor <span style="font-size:12px;color:var(--dim);font-weight:400" id="tb-host"></span></h1>
+      <h1>Live status <span style="font-size:12px;color:var(--dim);font-weight:400;text-transform:none;letter-spacing:0" id="tb-host"></span></h1>
       <div class="meta">
         <span>Last poll: <strong id="tb-poll">—</strong></span>
         <span>Next: <strong id="tb-next">—</strong>s</span>
@@ -1633,6 +1697,7 @@ tbody td { padding:9px 12px; color:#9aa3bc; vertical-align:middle; }
       </div>
       <!-- /Dashboard view -->
 
+      <div id="view-list">
       <!-- Toolbar (always shown) -->
       <div class="toolbar">
         <input class="tb-input" id="search" type="text" placeholder="Search username, customer, account #, area, NAP…" oninput="applyDisplay()">
@@ -1682,6 +1747,27 @@ tbody td { padding:9px 12px; color:#9aa3bc; vertical-align:middle; }
           <tbody id="tbody"></tbody>
         </table>
         <div id="no-results"></div>
+      </div>
+      </div><!-- /view-list -->
+
+      <!-- FTTH map view: positions only, nothing clickable -->
+      <div id="view-map" style="display:none">
+        <div class="section-header"><span class="section-title">FTTH Map</span><div class="section-line"></div>
+          <span class="map-meta" id="map-meta">Loading…</span></div>
+        <div class="map-tools">
+          <span class="lg"><i class="dv nap"></i>NAP box</span>
+          <span class="lg"><i class="dv olt"></i>OLT</span>
+          <span class="lg"><i class="dv spl"></i>Splitter / joint</span>
+          <span class="lg"><i class="hs on"></i>House online</span>
+          <span class="lg"><i class="hs off"></i>House offline</span>
+          <span class="lg"><i class="hs na"></i>Not in router</span>
+          <span class="lg"><i class="ln"></i>Fiber</span>
+          <span class="lg"><i class="ln cut"></i>Cut</span>
+          <label class="lg chk"><input type="checkbox" id="map-names" checked onchange="drawFtth()"> Box names</label>
+          <label class="lg chk"><input type="checkbox" id="map-houses" checked onchange="drawFtth()"> Houses</label>
+        </div>
+        <div id="ftth-map"></div>
+        <div class="map-note">View only — the map shows where the plant is. Box and subscriber details are in the FTTH map app for administrators.</div>
       </div>
 
     </div><!-- /content -->
@@ -1773,7 +1859,7 @@ function drawDonut(svgId, good, bad, total) {
   const sw = isLarge ? 18 : 11;
 
   const circ = 2 * Math.PI * r;
-  const track = \`<circle cx="\${cx}" cy="\${cy}" r="\${r}" fill="none" stroke="#252840" stroke-width="\${sw}"/>\`;
+  const track = \`<circle cx="\${cx}" cy="\${cy}" r="\${r}" fill="none" stroke="#e5e7eb" stroke-width="\${sw}"/>\`;
 
   if (total === 0) {
     svg.innerHTML = track;
@@ -1786,14 +1872,14 @@ function drawDonut(svgId, good, bad, total) {
   const goodDash  = goodRatio * circ;
 
   const badArc = bad > 0
-    ? \`<circle cx="\${cx}" cy="\${cy}" r="\${r}" fill="none" stroke="#e84040" stroke-width="\${sw}"
+    ? \`<circle cx="\${cx}" cy="\${cy}" r="\${r}" fill="none" stroke="#dc2626" stroke-width="\${sw}"
         stroke-dasharray="\${badDash} \${circ - badDash}"
         transform="rotate(-90 \${cx} \${cy})"/>\`
     : '';
 
   const greenRotate = -90 + (badRatio * 360);
   const goodArc = good > 0
-    ? \`<circle cx="\${cx}" cy="\${cy}" r="\${r}" fill="none" stroke="#8dc63f" stroke-width="\${sw}"
+    ? \`<circle cx="\${cx}" cy="\${cy}" r="\${r}" fill="none" stroke="#16a34a" stroke-width="\${sw}"
         stroke-dasharray="\${goodDash} \${circ - goodDash}"
         transform="rotate(\${greenRotate} \${cx} \${cy})"/>\`
     : '';
@@ -1906,9 +1992,86 @@ function selectCard(id) {
 function setView(v) {
   currentView = v;
   document.getElementById('view-dashboard').style.display = v==='dashboard' ? '' : 'none';
+  document.getElementById('view-list').style.display = v==='map' ? 'none' : '';
+  document.getElementById('view-map').style.display = v==='map' ? '' : 'none';
   document.getElementById('snav-dash').classList.toggle('active',  v==='dashboard');
   document.getElementById('snav-table').classList.toggle('active', v==='table');
+  document.getElementById('snav-map').classList.toggle('active', v==='map');
+  if (v==='map') openFtthMap(); else stopFtthMap();
   if (v==='table') { document.getElementById('filt-btns').style.display=''; document.getElementById('filt-div').style.display=''; }
+}
+
+// ---- FTTH map tab (view only) ----
+// Leaflet is loaded the first time the tab opens. Every marker and line is
+// non-interactive: no popups, no clicks — the map shows positions only.
+let ftthMap = null, ftthLayer = null, ftthData = null, ftthTimer = null, ftthFitted = false;
+function loadLeaflet() {
+  if (window.L) return Promise.resolve();
+  return new Promise((ok, bad) => {
+    const css = document.createElement('link'); css.rel = 'stylesheet'; css.href = '/vendor/leaflet/leaflet.css';
+    document.head.appendChild(css);
+    const js = document.createElement('script'); js.src = '/vendor/leaflet/leaflet.js';
+    js.onload = ok; js.onerror = () => bad(new Error('could not load the map library'));
+    document.head.appendChild(js);
+  });
+}
+async function openFtthMap() {
+  const meta = document.getElementById('map-meta');
+  try { await loadLeaflet(); } catch (e) { meta.textContent = e.message; return; }
+  if (!ftthMap) {
+    ftthMap = L.map('ftth-map', { zoomControl: true, attributionControl: true }).setView([10.245, 123.79], 14);
+    const street = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '&copy; OpenStreetMap' });
+    const sat = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', { maxZoom: 19, maxNativeZoom: 18, attribution: 'Imagery &copy; Esri' });
+    street.addTo(ftthMap);
+    L.control.layers({ 'Street': street, 'Satellite': sat }, null, { position: 'topright' }).addTo(ftthMap);
+    ftthLayer = L.layerGroup().addTo(ftthMap);
+    ftthMap.on('zoomend', drawFtth);
+  }
+  setTimeout(() => ftthMap.invalidateSize(), 50);
+  await refreshFtth();
+  clearInterval(ftthTimer);
+  ftthTimer = setInterval(refreshFtth, 60000);      // house colours follow the router
+}
+function stopFtthMap() { clearInterval(ftthTimer); ftthTimer = null; }
+async function refreshFtth() {
+  const meta = document.getElementById('map-meta');
+  try {
+    const r = await fetch('/api/ftth-map', { credentials: 'same-origin' });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+    ftthData = d;
+    const off = d.subs.filter(x => x.st === 'off').length;
+    meta.textContent = d.devices.length + ' boxes · ' + d.subs.length + ' houses' + (off ? ' · ' + off + ' offline' : '') + ' · updated ' + new Date().toLocaleTimeString();
+    drawFtth();
+    if (!ftthFitted) {
+      const pts = d.devices.map(x => [x.la, x.lo]);
+      if (pts.length) ftthMap.fitBounds(pts, { padding: [30, 30], maxZoom: 17 });
+      ftthFitted = true;
+    }
+  } catch (e) { meta.textContent = 'Map unavailable — ' + e.message; }
+}
+function drawFtth() {
+  if (!ftthMap || !ftthData) return;
+  ftthLayer.clearLayers();
+  const names = document.getElementById('map-names').checked && ftthMap.getZoom() >= 16;
+  const houses = document.getElementById('map-houses').checked;
+  const opt = { interactive: false, keyboard: false, bubblingMouseEvents: false };
+  ftthData.links.forEach(l => L.polyline(l.p, Object.assign({}, opt, {
+    color: l.s === 'cut' ? '#dc2626' : l.s === 'planned' ? '#94a3b8' : '#3b82f6', weight: 3, opacity: .9,
+    dashArray: l.s === 'cut' ? '4,6' : l.s === 'planned' ? '7,7' : null,
+  })).addTo(ftthLayer));
+  if (houses) ftthData.subs.forEach(h => L.circleMarker([h.la, h.lo], Object.assign({}, opt, {
+    radius: 4.5, color: '#fff', weight: 1.5, fillOpacity: 1,
+    fillColor: h.st === 'on' ? '#16a34a' : h.st === 'off' ? '#dc2626' : '#94a3b8',
+  })).addTo(ftthLayer));
+  const col = { NAP: '#2563eb', OLT: '#d9b345', SPLITTER: '#7c3aed', JOINT: '#64748b' };
+  ftthData.devices.forEach(d => {
+    const size = d.t === 'OLT' ? 16 : d.t === 'JOINT' ? 10 : 14;
+    const bg = d.s === 'planned' ? '#cbd5e1' : (col[d.t] || '#2563eb');
+    const lbl = names ? '<div class="ftth-lbl">' + esc(d.n) + '</div>' : '';
+    L.marker([d.la, d.lo], Object.assign({}, opt, { icon: L.divIcon({ className: '', iconSize: [size, size], iconAnchor: [size / 2, size / 2],
+      html: '<div class="ftth-pin ' + (d.t === 'OLT' ? 'olt' : '') + '" style="width:' + size + 'px;height:' + size + 'px;background:' + bg + '"></div>' + lbl }) })).addTo(ftthLayer);
+  });
 }
 
 // ---- Filter ----
@@ -2092,54 +2255,59 @@ function keyMatches(supplied) {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
-// ---------- dashboard auth ----------
+// ---------- FTTH map (view-only tab) ----------
+// The monitor asks the FTTH map app for the network with the map's service key
+// and passes on positions only: where the boxes, cables and houses are. No
+// subscriber names, accounts, ports or notes ever reach the browser, and the
+// page draws nothing clickable — technicians see the plant, nothing more.
+const FTTH_URL   = (process.env.FTTH_URL || '').replace(/\/+$/, '');
+const FTTH_TOKEN = process.env.FTTH_TOKEN || '';
+let ftthCache = { at: 0, net: null };
 
-function sessionToken() {
-  const crypto = require('crypto');
-  return crypto.createHmac('sha256', SESSION_SECRET).update('starline-monitor-v1').digest('hex');
+async function ftthNetwork() {
+  if (ftthCache.net && Date.now() - ftthCache.at < 2 * 60 * 1000) return ftthCache.net;
+  const r = await fetch(FTTH_URL + '/api/network', { headers: { 'x-api-key': FTTH_TOKEN }, signal: AbortSignal.timeout(15000) });
+  if (!r.ok) throw new Error('the FTTH map answered HTTP ' + r.status);
+  const net = await r.json();
+  ftthCache = { at: Date.now(), net };
+  return net;
 }
 
-function cookieOf(req, name) {
-  const raw = req.headers.cookie || '';
-  for (const part of raw.split(';')) {
-    const i = part.indexOf('=');
-    if (i === -1) continue;
-    if (part.slice(0, i).trim() === name) return part.slice(i + 1).trim();
+async function ftthMapView() {
+  const net = await ftthNetwork();
+  const r6 = (n) => Math.round(Number(n) * 1e6) / 1e6;
+  const portDev = new Map((net.ports || []).map(p => [p.id, p.device_id]));
+  const devById = new Map((net.devices || []).map(d => [d.id, d]));
+  const live = new Map((state.accounts || []).map(a => [String(a.username || '').toLowerCase(), a.status]));
+  const devices = (net.devices || []).filter(d => d.lat != null && d.lng != null).map(d => ({
+    t: d.type, n: d.name, la: r6(d.lat), lo: r6(d.lng), s: d.status,
+  }));
+  const links = [];
+  for (const l of net.links || []) {
+    const a = devById.get(portDev.get(l.from_port_id)), b = devById.get(portDev.get(l.to_port_id));
+    if (!a || !b) continue;
+    const mid = Array.isArray(l.path) ? l.path.map(p => [r6(p[0]), r6(p[1])]) : [];
+    links.push({ p: [[r6(a.lat), r6(a.lng)], ...mid, [r6(b.lat), r6(b.lng)]], s: l.status });
   }
-  return '';
+  const subs = [];
+  for (const sub of net.subscribers || []) {
+    if (sub.lat == null || sub.lng == null) continue;
+    const st = live.get(String(sub.pppoe_username || '').toLowerCase());
+    subs.push({ la: r6(sub.lat), lo: r6(sub.lng), st: st === 'online' ? 'on' : st === 'offline' ? 'off' : 'na' });
+  }
+  return { devices, links, subs, at: new Date(ftthCache.at).toISOString() };
 }
 
-/* A signed cookie (browser) or the service key (ticketing system). Fails closed:
-   with no DASHBOARD_PASSWORD set, nothing is served rather than everything. */
-function authed(req) {
+// ---------- dashboard auth ----------
+// Per-person accounts (admin / technician) live in monitor-auth.js.
+const monitorAuth = require('./monitor-auth');
+
+/* Who is asking: the ticketing/billing/map services with the shared key, or a
+   signed-in person. Fails closed. */
+async function whoIs(req) {
   const u = new URL(req.url, 'http://x');
-  if (API_TOKEN && keyMatches(req.headers['x-api-key'] || u.searchParams.get('key'))) return true;
-  if (!DASHBOARD_PASSWORD) return false;
-  const supplied = Buffer.from(cookieOf(req, 'sl_monitor'));
-  const expected = Buffer.from(sessionToken());
-  return supplied.length === expected.length &&
-    require('crypto').timingSafeEqual(supplied, expected);
-}
-
-function loginPage(message) {
-  return `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>StarLine Monitor</title>
-<style>body{background:#0b1220;color:#e2e8f0;font-family:-apple-system,Segoe UI,Roboto,sans-serif;display:flex;
-min-height:100vh;align-items:center;justify-content:center;margin:0}
-form{background:#111c31;padding:26px;border-radius:14px;width:300px;box-shadow:0 10px 40px rgba(0,0,0,.45)}
-h1{font-size:17px;margin:0 0 4px}p{font-size:12.5px;color:#93a4bd;margin:0 0 16px}
-input{width:100%;padding:11px;border-radius:9px;border:1px solid #27374f;background:#0b1220;color:#e2e8f0;
-font-size:15px;box-sizing:border-box}
-button{width:100%;margin-top:12px;padding:11px;border:0;border-radius:9px;background:#f2c230;color:#0b1220;
-font-weight:700;font-size:15px;cursor:pointer}
-.err{color:#fca5a5;font-size:12.5px;margin-top:10px}</style>
-<form method="POST" action="/login">
-  <h1>StarLine PPPoE Monitor</h1>
-  <p>Subscriber data — sign in to continue.</p>
-  <input type="password" name="password" placeholder="Password" autofocus autocomplete="current-password">
-  <button type="submit">Sign in</button>
-  ${message ? `<div class="err">${message}</div>` : ''}
-</form>`;
+  if (API_TOKEN && keyMatches(req.headers['x-api-key'] || u.searchParams.get('key'))) return { service: true, role: 'admin' };
+  return monitorAuth.currentUser(req);
 }
 
 // ---------- HTTP Server ----------
@@ -2163,49 +2331,18 @@ const server = http.createServer((req, res) => {
 async function handleRequest(req, res) {
   const path = req.url.split('?')[0];
 
-  /* ---- sign in ---- */
-  if (path === '/login' && req.method === 'POST') {
-    let body = '';
-    req.on('data', c => { body += c; if (body.length > 4096) req.destroy(); });
-    req.on('end', () => {
-      const supplied = decodeURIComponent(
-        (new URLSearchParams(body).get('password') || '').replace(/\+/g, ' '));
-      if (!DASHBOARD_PASSWORD) {
-        res.writeHead(503, { 'Content-Type': 'text/html' });
-        return res.end(loginPage('DASHBOARD_PASSWORD is not set on this service.'));
-      }
-      const a = Buffer.from(supplied), b = Buffer.from(DASHBOARD_PASSWORD);
-      const ok = a.length === b.length && require('crypto').timingSafeEqual(a, b);
-      if (!ok) {
-        res.writeHead(401, { 'Content-Type': 'text/html' });
-        return res.end(loginPage('Wrong password.'));
-      }
-      res.writeHead(302, {
-        'Set-Cookie': `sl_monitor=${sessionToken()}; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000${
-          req.headers['x-forwarded-proto'] === 'https' ? '; Secure' : ''}`,
-        Location: '/',
-      });
-      res.end();
-    });
-    return;
-  }
-  if (path === '/login') {
-    res.writeHead(200, { 'Content-Type': 'text/html' });
-    return res.end(loginPage(''));
-  }
-  if (path === '/logout') {
-    res.writeHead(302, { 'Set-Cookie': 'sl_monitor=; Path=/; Max-Age=0', Location: '/login' });
-    return res.end();
-  }
+  /* ---- sign in, first-time setup, accounts, brand images ---- */
+  if (await monitorAuth.handle(req, res, path)) return;
 
   /* ---- everything past here is subscriber data ---- */
-  if (!authed(req)) {
+  const who = await whoIs(req);
+  if (!who) {
     if (path.startsWith('/api/') || path === '/events') {
       res.writeHead(401, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify({ error: 'Not signed in' }));
     }
-    res.writeHead(401, { 'Content-Type': 'text/html' });
-    return res.end(loginPage(DASHBOARD_PASSWORD ? '' : 'DASHBOARD_PASSWORD is not set on this service.'));
+    res.writeHead(302, { Location: '/login' });
+    return res.end();
   }
 
   if (req.url === '/events') {
@@ -2219,6 +2356,13 @@ async function handleRequest(req, res) {
     sseClients.add(res);
     req.on('close', () => sseClients.delete(res));
     return;
+  }
+
+  if (path === '/api/ftth-map') {
+    const send = (code, body) => { res.writeHead(code, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(body)); };
+    if (!FTTH_URL || !FTTH_TOKEN) return send(503, { error: 'The FTTH map is not linked to the monitor (FTTH_URL / FTTH_TOKEN).' });
+    try { return send(200, await ftthMapView()); }
+    catch (e) { return send(502, { error: describeFetchError ? describeFetchError(e) : e.message }); }
   }
 
   if (req.url === '/api/state') {
@@ -2367,6 +2511,7 @@ async function handleRequest(req, res) {
 
   if (path === '/api/billing-pushlog') {
     const send = (code, body) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(body)); };
+    if (who.role !== 'admin') return send(403, { error: 'Administrator only.' });
     return send(200, { pushes: billingPushLog.slice(-200).reverse() });
   }
 
@@ -2469,8 +2614,8 @@ async function handleRequest(req, res) {
     });
   }
 
-  res.writeHead(200, { 'Content-Type': 'text/html' });
-  res.end(dashboardHtml());
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+  res.end(dashboardHtml(who));
 }
 
 server.listen(DASHBOARD_PORT, () => {
@@ -2493,6 +2638,7 @@ Offline time source:
   [POLL]   = fallback — first poll where monitor.js itself saw the
              account go offline (only used if that field is empty)
 `);
+  monitorAuth.init().catch(e => console.error('[auth] init failed:', e.message));
   pollRouter();
   setInterval(pollRouter, POLL_INTERVAL_MS);
   pollIsps();
