@@ -454,4 +454,4 @@ function userBarHtml(user) {
     <a class="hb" href="/logout">Sign out</a>`;
 }
 
-module.exports = { init, handle, currentUser, loginPage, userBarHtml, accountsOn };
+module.exports = { init, handle, currentUser, loginPage, userBarHtml, accountsOn, dbPool: () => (ready ? pool : null) };

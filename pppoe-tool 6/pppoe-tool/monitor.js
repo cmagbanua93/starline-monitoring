@@ -500,12 +500,16 @@ function pingHost(ip, timeoutMs = ISP_PING_TIMEOUT_MS) {
   });
 }
 
+const insights = require('./monitor-insights');
+
 async function pollIsps() {
+  const prevIsps = state.isps;
   const results = await Promise.all(ISP_LINKS.map(async isp => {
     const r = await pingHost(isp.ip);
     return { ...isp, online: r.online, latencyMs: r.latencyMs };
   }));
   state = { ...state, isps: results, ispsLastCheck: new Date().toISOString() };
+  try { insights.onIsps(prevIsps, results); } catch (e) { console.error('[insights]', e.message); }
   broadcast();
 }
 
@@ -1132,6 +1136,7 @@ async function pollRouter() {
       new Date(a.lastLogout).toDateString() === todayStr
     ).length;
     const alertActive = todayDownCount >= ALERT_THRESHOLD;
+    try { insights.onAccounts(state.accounts, updated); } catch (e) { console.error('[insights]', e.message); }
 
     state = {
       ...state,
@@ -1500,6 +1505,65 @@ tbody td { padding:9px 12px; color:#b7c4d3; vertical-align:middle; }
 #error-bar.active { display:block; }
 #no-results { text-align:center; color:var(--dim); padding:36px; font-size:13px; }
 
+/* ---- summary row ---- */
+.kpis { display:grid; grid-template-columns: repeat(6, minmax(0,1fr)); gap:10px; margin-bottom: 18px; }
+.kpi { background: var(--card); border:1px solid var(--border); border-radius:10px; padding:12px 14px; text-align:left;
+  display:flex; flex-direction:column; gap:3px; color: var(--text); font: inherit; cursor: default; }
+button.kpi { cursor:pointer; } button.kpi:hover { border-color: var(--accent); }
+.kpi-n { font-size: 26px; font-weight: 700; line-height: 1.1; font-variant-numeric: tabular-nums; color: #e6ebf2; }
+.kpi-n.good { color: var(--green); } .kpi-n.bad { color: var(--red); } .kpi-n.warn { color: var(--amber); }
+.kpi-l { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: .5px; }
+.sec-note { font-size: 11px; color: var(--dim); white-space: nowrap; }
+
+/* ---- panels ---- */
+.insight-row { display:grid; grid-template-columns: 1fr 1fr; gap:14px; margin: 18px 0 14px; }
+.panel { background: var(--card); border:1px solid var(--border); border-radius:12px; padding:14px 16px; min-width:0; }
+.panel-h { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:10px; flex-wrap:wrap; }
+.empty { color: var(--dim); font-size: 12.5px; padding: 10px 0; }
+.nap-list, .feed-list { max-height: 300px; overflow-y: auto; }
+.nap-row { display:grid; grid-template-columns: minmax(0,1fr) auto; gap:4px 12px; padding:9px 4px; border-bottom:1px solid var(--border); cursor:pointer; }
+.nap-row:hover { background: var(--card2); }
+.nap-row:last-child { border-bottom: 0; }
+.nap-name { font-weight:600; font-size:13.5px; color:#e6ebf2; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.nap-count { font-size:13px; font-weight:700; color: var(--red); text-align:right; font-variant-numeric: tabular-nums; }
+.nap-count span { color: var(--dim); font-weight:500; }
+.nap-bar { grid-column: 1 / -1; height:6px; border-radius:3px; background: var(--card2); overflow:hidden; }
+.nap-bar i { display:block; height:100%; border-radius:3px; background: var(--red); }
+.nap-meta { grid-column: 1 / -1; font-size: 11.5px; color: var(--dim); }
+.nap-flag { display:inline-block; font-size:10.5px; font-weight:700; color:#fff; background: var(--red); border-radius:99px; padding:1px 7px; margin-right:6px; }
+.chips { display:flex; gap:4px; flex-wrap:wrap; }
+.chip-f { background: var(--card2); border:1px solid var(--border); color: var(--dim); border-radius:99px; padding:3px 10px; font-size:11.5px; cursor:pointer; font-family:inherit; }
+.chip-f.active { background: var(--accent); border-color: var(--accent); color:#0b2236; font-weight:700; }
+.ev { display:grid; grid-template-columns: 64px 12px minmax(0,1fr); gap:8px; align-items:start; padding:7px 2px; border-bottom:1px solid var(--border); font-size:12.5px; }
+.ev:last-child { border-bottom:0; }
+.ev-t { color: var(--dim); font-variant-numeric: tabular-nums; font-size: 11.5px; padding-top:1px; white-space: nowrap; }
+.ev-d { width:9px; height:9px; border-radius:50%; margin-top:4px; }
+.ev-d.down { background: var(--red); } .ev-d.up { background: var(--green); }
+.ev-d.isp-down, .ev-d.nap { background: var(--amber); } .ev-d.isp-up, .ev-d.nap-ok { background: var(--isp-up); }
+.ev-x { color: #c9d4e0; overflow-wrap:anywhere; } .ev-x b { color:#e6ebf2; }
+.ev-day { font-size:10.5px; color: var(--dim); text-transform:uppercase; letter-spacing:.5px; padding:8px 2px 2px; }
+
+/* ---- 24 h chart ---- */
+.trend-panel { margin-bottom: 18px; }
+.trend-chart { position: relative; height: 190px; }
+.trend-chart svg { display:block; width:100%; height:100%; overflow: visible; }
+.trend-tip { position:absolute; pointer-events:none; background:#0b1622; border:1px solid var(--border); border-radius:8px; padding:7px 9px; font-size:12px; color:#e6ebf2; white-space:nowrap; box-shadow:0 6px 18px rgba(0,0,0,.45); }
+.trend-tip .m { color: var(--dim); font-size: 11px; }
+.isp-spark { display:block; width:100%; height:28px; margin-top:2px; }
+
+/* ---- compact overview ---- */
+.live-card { min-height: 0; padding: 20px; }
+.lc-header { margin-bottom: 14px; }
+.lc-donut-wrap { margin-bottom: 16px; }
+.lc-donut-wrap svg { width: 150px; height: 150px; }
+.lc-big-num { font-size: 38px; }
+.lc-stat-n { font-size: 26px; }
+.dcard { padding: 14px 16px; }
+.dcard-title { margin-bottom: 8px; }
+.donut-wrap svg { width: 74px; height: 74px; }
+.donut-num { font-size: 17px; }
+.overview-panel { margin-bottom: 14px; }
+
 /* ---- FTTH map tab ---- */
 #ftth-map { height: calc(100vh - 230px); min-height: 380px; border: 1px solid var(--border); border-radius: 12px; background: #1a2533; }
 .map-meta { font-size: 11.5px; color: var(--dim); white-space: nowrap; }
@@ -1513,6 +1577,8 @@ tbody td { padding:9px 12px; color:#b7c4d3; vertical-align:middle; }
 .hs.on { background:#16a34a; } .hs.off { background:#dc2626; } .hs.na { background:#94a3b8; }
 .ln { width:22px; height:3px; border-radius:2px; background:#3b82f6; } .ln.cut { background: repeating-linear-gradient(90deg,#dc2626 0 4px,transparent 4px 7px); }
 .map-note { font-size: 11.5px; color: var(--dim); margin-top: 8px; }
+.ftth-down { position:absolute; left:16px; top:-26px; white-space:nowrap; background:#ef4444; color:#fff; font: 700 11px Inter, sans-serif; padding:2px 7px; border-radius:99px; box-shadow:0 1px 4px rgba(0,0,0,.4); pointer-events:none; }
+.lg i.ring { width:12px; height:12px; border-radius:50%; border:2px solid #ef4444; background: rgba(239,68,68,.18); }
 .ftth-pin { border-radius:50%; border:2px solid #fff; box-shadow:0 1px 4px rgba(0,0,0,.45); }
 .ftth-pin.olt { border-radius:4px; }
 .ftth-lbl { position:absolute; top:14px; left:50%; transform:translateX(-50%); white-space:nowrap; font: 700 10.5px Inter, sans-serif; color:#0b2236;
@@ -1520,7 +1586,11 @@ tbody td { padding:9px 12px; color:#b7c4d3; vertical-align:middle; }
 .leaflet-container { font-family: Inter, sans-serif; }
 
 /* ---- Mobile ---- */
+@media (max-width: 1100px) {
+  .kpis { grid-template-columns: repeat(3, minmax(0,1fr)); }
+}
 @media (max-width: 900px) {
+  .insight-row { grid-template-columns: 1fr; }
   .overview-panel { grid-template-columns: 1fr; }
   .live-card { min-height: 240px; padding: 20px; }
 }
@@ -1541,6 +1611,9 @@ tbody td { padding:9px 12px; color:#b7c4d3; vertical-align:middle; }
   .isp-panel { grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; }
   .isp-card { padding: 12px 14px; }
   .history-grid { grid-template-columns: 1fr; grid-template-rows: none; gap: 10px; }
+  .kpis { grid-template-columns: repeat(2, minmax(0,1fr)); gap: 8px; }
+  .kpi { padding: 10px 12px; } .kpi-n { font-size: 22px; }
+  .trend-chart { height: 160px; }
   #ftth-map { height: calc(100vh - 260px); }
   .lc-donut-wrap svg { width: 140px; height: 140px; }
   .lc-stats { gap: 22px; }
@@ -1608,9 +1681,43 @@ tbody td { padding:9px 12px; color:#b7c4d3; vertical-align:middle; }
       <!-- Dashboard view -->
       <div id="view-dashboard">
 
-        <div class="section-header"><span class="section-title">ISP Links</span><div class="section-line"></div></div>
+        <!-- At a glance -->
+        <div class="kpis">
+          <button class="kpi" onclick="kpiFilter('online')" title="Show online accounts"><span class="kpi-n good" id="k-on">—</span><span class="kpi-l">Online now</span></button>
+          <button class="kpi" onclick="kpiFilter('offline')" title="Show offline accounts"><span class="kpi-n bad" id="k-off">—</span><span class="kpi-l">Offline now</span></button>
+          <button class="kpi" onclick="selectCard('today'); scrollToTable()" title="Show today's outages"><span class="kpi-n" id="k-today">—</span><span class="kpi-l">Went down today</span></button>
+          <div class="kpi"><span class="kpi-n" id="k-avail">—</span><span class="kpi-l">Connected</span></div>
+          <div class="kpi"><span class="kpi-n" id="k-isp">—</span><span class="kpi-l">ISP links up</span></div>
+          <button class="kpi" onclick="document.getElementById('nap-panel').scrollIntoView({behavior:'smooth',block:'center'})" title="Jump to NAP outages"><span class="kpi-n" id="k-nap">—</span><span class="kpi-l">NAP alerts</span></button>
+        </div>
+
+        <div class="section-header"><span class="section-title">ISP Links</span><div class="section-line"></div><span class="sec-note">latency, last 24 h</span></div>
 
         <div class="isp-panel" id="isp-panel"></div>
+
+        <!-- NAP outages + live events -->
+        <div class="insight-row">
+          <div class="panel" id="nap-panel">
+            <div class="panel-h"><span class="section-title">Outage by NAP box</span><span class="sec-note" id="nap-note"></span></div>
+            <div id="nap-list" class="nap-list"><div class="empty">Waiting for the first poll…</div></div>
+          </div>
+          <div class="panel">
+            <div class="panel-h"><span class="section-title">Live events</span>
+              <span class="chips" id="feed-chips">
+                <button class="chip-f active" data-f="all" onclick="setFeedFilter('all')">All</button>
+                <button class="chip-f" data-f="down" onclick="setFeedFilter('down')">Down</button>
+                <button class="chip-f" data-f="up" onclick="setFeedFilter('up')">Back</button>
+                <button class="chip-f" data-f="net" onclick="setFeedFilter('net')">ISP &amp; NAP</button>
+              </span></div>
+            <div id="feed-list" class="feed-list"><div class="empty">No events yet — they appear as subscribers go offline or come back.</div></div>
+          </div>
+        </div>
+
+        <!-- 24-hour trend -->
+        <div class="panel trend-panel">
+          <div class="panel-h"><span class="section-title">Offline subscribers — last 24 hours</span><span class="sec-note" id="trend-note"></span></div>
+          <div id="trend-chart" class="trend-chart"><div class="empty">Collecting data — the chart fills in over the day (5-minute steps).</div></div>
+        </div>
 
         <div class="section-header"><span class="section-title">Overview</span><div class="section-line"></div></div>
 
@@ -1774,6 +1881,7 @@ tbody td { padding:9px 12px; color:#b7c4d3; vertical-align:middle; }
           <span class="lg"><i class="hs na"></i>Not in router</span>
           <span class="lg"><i class="ln"></i>Fiber</span>
           <span class="lg"><i class="ln cut"></i>Cut</span>
+          <span class="lg"><i class="ring"></i>Box with outage</span>
           <label class="lg chk"><input type="checkbox" id="map-names" checked onchange="drawFtth()"> Box names</label>
           <label class="lg chk"><input type="checkbox" id="map-houses" checked onchange="drawFtth()"> Houses</label>
         </div>
@@ -1853,8 +1961,10 @@ function renderIsps(isps) {
       <div class="isp-plan">\${esc(isp.plan)}</div>
       <div class="isp-ip">\${esc(isp.ip)}</div>
       <div class="isp-latency">\${lat}</div>
+      <svg class="isp-spark" data-isp="\${esc(isp.name)}" role="img" aria-label="Latency over the last 24 hours"></svg>
     </div>\`;
   }).join('');
+  drawSparks();
 }
 
 // ---- Donut chart ----
@@ -1950,9 +2060,11 @@ function render(data) {
   cdTimer = setInterval(() => { rem=Math.max(0,rem-1); document.getElementById('tb-next').textContent=rem; }, 1000);
 
   allAccounts = data.accounts || [];
+  LAST_ISPS = data.isps || [];
   updateCards();
   applyDisplay();
   renderIsps(data.isps);
+  updateInsights();
 }
 
 // ---- Update donut cards ----
@@ -2010,6 +2122,253 @@ function setView(v) {
   if (v==='map') openFtthMap(); else stopFtthMap();
   if (v==='table') { document.getElementById('filt-btns').style.display=''; document.getElementById('filt-div').style.display=''; }
 }
+
+// ---- Insights: summary row, NAP outages, events feed, 24 h trend ----
+// Same rule as the server (monitor-insights.js): a NAP is "suspected" when 3+ of
+// its subscribers dropped within 10 minutes of each other (last 6 h), or when
+// 3+ are down and that is at least half the box.
+function napGroups(accounts) {
+  var groups = {}, order = [];
+  (accounts || []).forEach(function (a) {
+    var nap = String(a.area || String(a.napBox || '').split(' / ')[0] || '').trim();
+    if (!nap) return;
+    var g = groups[nap];
+    if (!g) { g = groups[nap] = { nap: nap, total: 0, offline: 0, drops: [] }; order.push(g); }
+    g.total++;
+    if (a.status === 'offline') { g.offline++; if (a.lastLogout) g.drops.push(new Date(a.lastLogout).getTime()); }
+  });
+  var recent = Date.now() - 6 * 3600e3, out = [];
+  order.forEach(function (g) {
+    if (!g.offline) return;
+    var d = g.drops.filter(function (t) { return t >= recent; }).sort(function (x, y) { return x - y; });
+    var cluster = 0;
+    for (var i = 0, j = 0; i < d.length; i++) { while (d[i] - d[j] > 600000) j++; cluster = Math.max(cluster, i - j + 1); }
+    g.cluster = cluster >= 2 ? cluster : 0;
+    g.suspected = cluster >= 3 || (g.offline >= 3 && g.offline / g.total >= 0.5);
+    g.lastDrop = g.drops.length ? Math.max.apply(null, g.drops) : null;
+    out.push(g);
+  });
+  out.sort(function (x, y) { return (y.suspected - x.suspected) || (y.offline - x.offline) || (y.offline / y.total - x.offline / x.total); });
+  return out;
+}
+
+var LAST_ISPS = [];
+function updateInsights() {
+  var total = allAccounts.length;
+  var on = allAccounts.filter(function (a) { return a.status === 'online'; }).length;
+  var off = total - on;
+  var today = allAccounts.filter(function (a) { return a.status === 'offline' && a.lastLogout && inPeriod(a.lastLogout, 'today'); }).length;
+  var groups = napGroups(allAccounts);
+  var suspected = groups.filter(function (g) { return g.suspected; }).length;
+  var ispUp = LAST_ISPS.filter(function (i) { return i.online === true; }).length;
+
+  document.getElementById('k-on').textContent = on;
+  document.getElementById('k-off').textContent = off;
+  document.getElementById('k-today').textContent = today;
+  var kt = document.getElementById('k-today'); kt.className = 'kpi-n' + (today ? ' warn' : '');
+  document.getElementById('k-avail').textContent = total ? (Math.floor(on / total * 1000) / 10) + '%' : '—';
+  var ki = document.getElementById('k-isp');
+  ki.textContent = LAST_ISPS.length ? ispUp + ' / ' + LAST_ISPS.length : '—';
+  ki.className = 'kpi-n' + (LAST_ISPS.length && ispUp < LAST_ISPS.length ? ' bad' : (LAST_ISPS.length ? ' good' : ''));
+  var kn = document.getElementById('k-nap');
+  kn.textContent = suspected; kn.className = 'kpi-n' + (suspected ? ' bad' : ' good');
+
+  // NAP list
+  var list = document.getElementById('nap-list');
+  var withNap = allAccounts.filter(function (a) { return a.napBox || a.area; }).length;
+  document.getElementById('nap-note').textContent = groups.length ? groups.length + ' box' + (groups.length === 1 ? '' : 'es') + ' with someone offline' : '';
+  if (!total) list.innerHTML = '<div class="empty">Waiting for the first poll…</div>';
+  else if (!withNap) list.innerHTML = '<div class="empty">No NAP / area information yet — it comes from billing. Once billing is connected, offline subscribers are grouped by box here.</div>';
+  else if (!groups.length) list.innerHTML = '<div class="empty">Everyone with a NAP box on record is online.</div>';
+  else list.innerHTML = groups.slice(0, 40).map(function (g) {
+    var pct = Math.round(g.offline / g.total * 100);
+    var meta = [];
+    if (g.cluster) meta.push(g.cluster + ' dropped within 10 min');
+    if (g.lastDrop) meta.push('last drop ' + agoText(g.lastDrop));
+    return '<div class="nap-row" onclick="napClick(this.dataset.nap)" data-nap="' + esc(g.nap) + '" title="Show these subscribers in the list">' +
+      '<div class="nap-name">' + (g.suspected ? '<span class="nap-flag">Check box / fiber</span>' : '') + esc(g.nap) + '</div>' +
+      '<div class="nap-count">' + g.offline + ' <span>of ' + g.total + ' down</span></div>' +
+      '<div class="nap-bar"><i style="width:' + Math.max(4, pct) + '%;opacity:' + (g.suspected ? 1 : .55) + '"></i></div>' +
+      (meta.length ? '<div class="nap-meta">' + esc(meta.join(' · ')) + '</div>' : '') + '</div>';
+  }).join('');
+
+  if (currentView === 'map' && typeof drawFtth === 'function') drawFtth();
+}
+
+function agoText(t) {
+  var m = Math.round((Date.now() - t) / 60000);
+  if (m < 1) return 'just now';
+  if (m < 60) return m + ' min ago';
+  var h = Math.floor(m / 60);
+  if (h < 24) return h + ' h ' + (m % 60) + ' min ago';
+  return Math.floor(h / 24) + ' d ago';
+}
+function scrollToTable() { var el = document.getElementById('view-list'); if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' }); }
+function kpiFilter(f) { selectCard('live'); setFilter(f); document.getElementById('search').value = ''; applyDisplay(); scrollToTable(); }
+function napClick(nap) {
+  selectCard('live'); setFilter('offline');
+  document.getElementById('search').value = nap; applyDisplay(); scrollToTable();
+}
+
+// ---- events feed (fetched in small pieces: only what is new since last time) ----
+var FEED = [], FEED_SEQ = 0, FEED_FILTER = 'all';
+function loadFeed() {
+  if (document.hidden) return;
+  fetch('/api/feed?since=' + FEED_SEQ, { credentials: 'same-origin' }).then(function (r) { return r.ok ? r.json() : null; }).then(function (d) {
+    if (!d) return;
+    if (d.seq < FEED_SEQ) { FEED = []; }            // the monitor restarted without its history
+    FEED_SEQ = d.seq;
+    if (d.events.length) { FEED = FEED.concat(d.events).slice(-300); renderFeed(); }
+    else if (!FEED.length) renderFeed();
+  }).catch(function () {});
+}
+function setFeedFilter(f) {
+  FEED_FILTER = f;
+  document.querySelectorAll('#feed-chips .chip-f').forEach(function (b) { b.classList.toggle('active', b.dataset.f === f); });
+  renderFeed();
+}
+function renderFeed() {
+  var box = document.getElementById('feed-list');
+  var match = { all: null, down: ['down'], up: ['up'], net: ['isp-down', 'isp-up', 'nap', 'nap-ok'] }[FEED_FILTER];
+  var list = FEED.filter(function (e) { return !match || match.indexOf(e.kind) !== -1; }).slice().reverse().slice(0, 120);
+  if (!list.length) { box.innerHTML = '<div class="empty">' + (FEED.length ? 'Nothing of this kind yet.' : 'No events yet — they appear as subscribers go offline or come back.') + '</div>'; return; }
+  var html = '', lastDay = '';
+  var todayStr = new Date().toDateString();
+  list.forEach(function (e) {
+    var d = new Date(e.t);
+    var day = d.toDateString();
+    if (day !== lastDay) {
+      if (lastDay || day !== todayStr) html += '<div class="ev-day">' + (day === todayStr ? 'Today' : d.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' })) + '</div>';
+      lastDay = day;
+    }
+    html += '<div class="ev"><span class="ev-t">' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + '</span>' +
+      '<span class="ev-d ' + esc(e.kind) + '"></span><span class="ev-x">' + esc(e.text) + '</span></div>';
+  });
+  box.innerHTML = html;
+}
+
+// ---- 24-hour trend ----
+var TREND = null;
+function loadTrend() {
+  if (document.hidden) return;
+  fetch('/api/trend', { credentials: 'same-origin' }).then(function (r) { return r.ok ? r.json() : null; }).then(function (d) {
+    if (!d) return;
+    TREND = d; drawTrend(); drawSparks();
+  }).catch(function () {});
+}
+var SVGNS = 'http://www.w3.org/2000/svg';
+function svgEl(tag, attrs) { var el = document.createElementNS(SVGNS, tag); for (var k in attrs) el.setAttribute(k, attrs[k]); return el; }
+function hhmm(t) { return new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); }
+
+function drawTrend() {
+  var box = document.getElementById('trend-chart');
+  if (!box || !TREND) return;
+  var pts = TREND.points.filter(function (p) { return p.off != null; });
+  var note = document.getElementById('trend-note');
+  if (pts.length < 2) { box.innerHTML = '<div class="empty">Collecting data — the chart fills in over the day (5-minute steps).</div>'; note.textContent = ''; return; }
+  var maxOff = Math.max.apply(null, pts.map(function (p) { return p.off; }));
+  var minOff = Math.min.apply(null, pts.map(function (p) { return p.off; }));
+  note.textContent = 'low ' + minOff + ' · high ' + maxOff + ' · now ' + pts[pts.length - 1].off;
+
+  var W = box.clientWidth || 600, H = box.clientHeight || 190;
+  var L = 36, R = 10, T = 10, B = 22;
+  var t1 = Date.now(), t0 = t1 - 24 * 3600e3;
+  var step = maxOff <= 5 ? 1 : maxOff <= 20 ? 5 : maxOff <= 50 ? 10 : maxOff <= 100 ? 25 : 50;
+  var yMax = Math.max(step, Math.ceil(maxOff * 1.1 / step) * step);
+  var x = function (t) { return L + (t - t0) / (t1 - t0) * (W - L - R); };
+  var y = function (v) { return T + (1 - v / yMax) * (H - T - B); };
+
+  box.innerHTML = '';
+  var svg = svgEl('svg', { viewBox: '0 0 ' + W + ' ' + H, role: 'img', 'aria-label': 'Offline subscribers over the last 24 hours, now ' + pts[pts.length - 1].off });
+  // grid + y labels
+  for (var v = 0; v <= yMax; v += step) {
+    if (yMax / step > 5 && (v / step) % 2) continue;
+    svg.appendChild(svgEl('line', { x1: L, x2: W - R, y1: y(v), y2: y(v), stroke: '#1f2c3d', 'stroke-width': 1 }));
+    var tl = svgEl('text', { x: L - 6, y: y(v) + 4, 'text-anchor': 'end', fill: '#8496ab', 'font-size': 10.5 }); tl.textContent = v; svg.appendChild(tl);
+  }
+  // x labels every 4 h
+  var first = new Date(t0); first.setMinutes(0, 0, 0); first = first.getTime() + 3600e3;
+  for (var t = first; t < t1; t += 3600e3) {
+    if (new Date(t).getHours() % 4) continue;
+    var xl = svgEl('text', { x: x(t), y: H - 6, 'text-anchor': 'middle', fill: '#8496ab', 'font-size': 10.5 }); xl.textContent = hhmm(t); svg.appendChild(xl);
+  }
+  // line + area, broken where data is missing (monitor restarting)
+  var segs = [], cur = [];
+  pts.forEach(function (p, i) {
+    if (i && p.t - pts[i - 1].t > 3 * TREND.bucketMs) { segs.push(cur); cur = []; }
+    cur.push(p);
+  });
+  segs.push(cur);
+  segs.forEach(function (sg) {
+    if (!sg.length) return;
+    var d = sg.map(function (p, i) { return (i ? 'L' : 'M') + x(p.t).toFixed(1) + ',' + y(p.off).toFixed(1); }).join(' ');
+    var area = d + ' L' + x(sg[sg.length - 1].t).toFixed(1) + ',' + y(0) + ' L' + x(sg[0].t).toFixed(1) + ',' + y(0) + ' Z';
+    svg.appendChild(svgEl('path', { d: area, fill: '#ef4444', 'fill-opacity': .12, stroke: 'none' }));
+    svg.appendChild(svgEl('path', { d: d, fill: 'none', stroke: '#ef4444', 'stroke-width': 2, 'stroke-linejoin': 'round', 'stroke-linecap': 'round' }));
+  });
+  var last = pts[pts.length - 1];
+  svg.appendChild(svgEl('circle', { cx: x(last.t), cy: y(last.off), r: 4, fill: '#ef4444', stroke: '#121a25', 'stroke-width': 2 }));
+
+  // hover: crosshair + tooltip
+  var cross = svgEl('line', { y1: T, y2: H - B, stroke: '#8496ab', 'stroke-width': 1, 'stroke-dasharray': '3,3', visibility: 'hidden' });
+  var dot = svgEl('circle', { r: 4.5, fill: '#ef4444', stroke: '#121a25', 'stroke-width': 2, visibility: 'hidden' });
+  svg.appendChild(cross); svg.appendChild(dot);
+  var hit = svgEl('rect', { x: L, y: 0, width: W - L - R, height: H, fill: 'transparent' });
+  svg.appendChild(hit);
+  box.appendChild(svg);
+  var tip = document.createElement('div'); tip.className = 'trend-tip'; tip.style.display = 'none'; box.appendChild(tip);
+  function move(ev) {
+    var rect = svg.getBoundingClientRect();
+    var px = (ev.clientX - rect.left) * (W / rect.width);
+    var tt = t0 + (px - L) / (W - L - R) * (t1 - t0);
+    var best = pts[0];
+    pts.forEach(function (p) { if (Math.abs(p.t - tt) < Math.abs(best.t - tt)) best = p; });
+    cross.setAttribute('x1', x(best.t)); cross.setAttribute('x2', x(best.t)); cross.setAttribute('visibility', 'visible');
+    dot.setAttribute('cx', x(best.t)); dot.setAttribute('cy', y(best.off)); dot.setAttribute('visibility', 'visible');
+    tip.innerHTML = '<div><b>' + best.off + '</b> offline · ' + best.on + ' online</div><div class="m">' + hhmm(best.t) + ' – ' + hhmm(best.t + TREND.bucketMs) + '</div>';
+    tip.style.display = 'block';
+    var left = x(best.t) / W * rect.width + 12;
+    if (left + tip.offsetWidth > rect.width) left = x(best.t) / W * rect.width - tip.offsetWidth - 12;
+    tip.style.left = left + 'px'; tip.style.top = '6px';
+  }
+  function leave() { cross.setAttribute('visibility', 'hidden'); dot.setAttribute('visibility', 'hidden'); tip.style.display = 'none'; }
+  hit.addEventListener('pointermove', move); hit.addEventListener('pointerdown', move); hit.addEventListener('pointerleave', leave);
+}
+
+// small latency line under each ISP card; red ticks where the link was down
+function drawSparks() {
+  if (!TREND) return;
+  document.querySelectorAll('svg.isp-spark').forEach(function (svg) {
+    var name = svg.getAttribute('data-isp');
+    var pts = TREND.points.filter(function (p) { return p.isp && p.isp[name] != null; });
+    svg.innerHTML = '';
+    if (pts.length < 2) return;
+    var W = svg.clientWidth || 160, H = 28, t1 = Date.now(), t0 = t1 - 24 * 3600e3;
+    svg.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
+    var vals = pts.filter(function (p) { return p.isp[name] >= 0; }).map(function (p) { return p.isp[name]; });
+    var max = Math.max.apply(null, vals.concat([10])), min = Math.min.apply(null, vals.concat([max]));
+    var x = function (t) { return (t - t0) / (t1 - t0) * W; };
+    var y = function (v) { return 3 + (1 - (v - min) / Math.max(1, max - min)) * (H - 8); };
+    var d = '', pen = false;
+    pts.forEach(function (p, i) {
+      var v = p.isp[name];
+      if (v < 0) { svg.appendChild(svgEl('rect', { x: x(p.t) - 1, y: H - 4, width: 3, height: 4, fill: '#ef4444' })); pen = false; return; }
+      d += (pen && i && p.t - pts[i - 1].t <= 3 * TREND.bucketMs ? 'L' : 'M') + x(p.t).toFixed(1) + ',' + y(v).toFixed(1) + ' ';
+      pen = true;
+    });
+    if (d) svg.appendChild(svgEl('path', { d: d, fill: 'none', stroke: '#38bdf8', 'stroke-width': 1.5, 'stroke-linejoin': 'round', opacity: .9 }));
+    var down = pts.filter(function (p) { return p.isp[name] < 0; }).length;
+    var tt = svgEl('title', {}); tt.textContent = 'Last 24 h: ' + (vals.length ? min + '–' + max + ' ms' : 'no data') + (down ? ' · down ' + (down * 5) + ' min' : '');
+    svg.appendChild(tt);
+  });
+}
+
+window.addEventListener('resize', function () { clearTimeout(window.__rz); window.__rz = setTimeout(function () { drawTrend(); drawSparks(); }, 200); });
+document.addEventListener('visibilitychange', function () { if (!document.hidden) { loadFeed(); loadTrend(); } });
+setInterval(loadFeed, 30000);
+setInterval(loadTrend, 5 * 60000);
+setTimeout(function () { loadFeed(); loadTrend(); }, 300);
+
 
 // ---- FTTH map tab (view only) ----
 // Leaflet is loaded the first time the tab opens. Every marker and line is
@@ -2074,6 +2433,17 @@ function drawFtth() {
     radius: 4.5, color: '#fff', weight: 1.5, fillOpacity: 1,
     fillColor: h.st === 'on' ? '#16a34a' : h.st === 'off' ? '#dc2626' : '#94a3b8',
   })).addTo(ftthLayer));
+  /* boxes with subscribers down: amber ring; suspected box / fiber problem: red ring + count */
+  const napDown = {};
+  napGroups(allAccounts).forEach(g => { napDown[g.nap.toUpperCase()] = g; });
+  ftthData.devices.forEach(d => {
+    const g = napDown[String(d.n || '').toUpperCase()];
+    if (!g) return;
+    L.circleMarker([d.la, d.lo], Object.assign({}, opt, { radius: g.suspected ? 15 : 11, color: g.suspected ? '#ef4444' : '#f59e0b',
+      weight: g.suspected ? 3 : 2, fill: true, fillOpacity: g.suspected ? .18 : .08, fillColor: g.suspected ? '#ef4444' : '#f59e0b' })).addTo(ftthLayer);
+    if (g.suspected) L.marker([d.la, d.lo], Object.assign({}, opt, { icon: L.divIcon({ className: '', iconSize: [0, 0],
+      html: '<div class="ftth-down">' + g.offline + ' down</div>' }) })).addTo(ftthLayer);
+  });
   const col = { NAP: '#2563eb', OLT: '#d9b345', SPLITTER: '#7c3aed', JOINT: '#64748b' };
   ftthData.devices.forEach(d => {
     const size = d.t === 'OLT' ? 16 : d.t === 'JOINT' ? 10 : 14;
@@ -2375,6 +2745,16 @@ async function handleRequest(req, res) {
     catch (e) { return send(502, { error: describeFetchError ? describeFetchError(e) : e.message }); }
   }
 
+  /* events feed (incremental), 24 h trend, NAP outage groups — any signed-in user */
+  if (path === '/api/feed' || path === '/api/trend' || path === '/api/nap-outages') {
+    const u = new URL(req.url, 'http://x');
+    const body = path === '/api/feed' ? insights.feedSince(u.searchParams.get('since'))
+      : path === '/api/trend' ? insights.trend()
+      : { naps: insights.napOutages(state.accounts) };
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+    return res.end(JSON.stringify(body));
+  }
+
   if (req.url === '/api/state') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(state));
@@ -2628,6 +3008,9 @@ async function handleRequest(req, res) {
   res.end(dashboardHtml(who));
 }
 
+/* Railway stops the old copy with SIGTERM on every deploy: keep the history. */
+process.on('SIGTERM', () => { insights.save().finally(() => process.exit(0)); setTimeout(() => process.exit(0), 4000).unref(); });
+
 server.listen(DASHBOARD_PORT, () => {
   console.log(`
 ╔══════════════════════════════════════════════╗
@@ -2648,7 +3031,10 @@ Offline time source:
   [POLL]   = fallback — first poll where monitor.js itself saw the
              account go offline (only used if that field is empty)
 `);
-  monitorAuth.init().catch(e => console.error('[auth] init failed:', e.message));
+  monitorAuth.init()
+    .catch(e => console.error('[auth] init failed:', e.message))
+    .then(() => insights.init(monitorAuth.dbPool()))
+    .catch(e => console.error('[insights] init failed:', e.message));
   pollRouter();
   setInterval(pollRouter, POLL_INTERVAL_MS);
   pollIsps();
