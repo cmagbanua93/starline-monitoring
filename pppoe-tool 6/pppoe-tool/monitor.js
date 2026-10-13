@@ -1200,27 +1200,27 @@ function dashboardHtml(user) {
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-/* StarLine Internet brand — same as the ticketing app, FTTH map, pay page and portal */
+/* StarLine Internet brand on a dark background — navy header, gold accents */
 :root {
   --navy:     #12304a;
   --navy2:    #1b4166;
   --gold:     #d9b345;
-  --bg:       #f3f5f8;
-  --sidebar:  #12304a;
-  --card:     #ffffff;
-  --card2:    #f6f8fb;
-  --border:   #e5e7eb;
-  --green:    #16a34a;
-  --red:      #dc2626;
-  --amber:    #d97706;
-  --blue:     #2563eb;
-  --purple:   #7c3aed;
-  --text:     #1f2937;
-  --dim:      #6b7280;
-  --accent:   #12304a;
-  --isp-up:     #16a34a;
-  --isp-down:   #ea580c;
-  --isp-accent: #6366f1;
+  --bg:       #0a0f16;
+  --sidebar:  #0d1a29;
+  --card:     #121a25;
+  --card2:    #182333;
+  --border:   #233246;
+  --green:    #22c55e;
+  --red:      #ef4444;
+  --amber:    #f59e0b;
+  --blue:     #3b82f6;
+  --purple:   #a78bfa;
+  --text:     #dbe4ee;
+  --dim:      #8496ab;
+  --accent:   #d9b345;
+  --isp-up:     #38bdf8;
+  --isp-down:   #fb923c;
+  --isp-accent: #818cf8;
 }
 * { box-sizing: border-box; margin:0; padding:0; }
 body { font-family: Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; background: var(--bg); color: var(--text); min-height:100vh; display:flex; flex-direction:column; -webkit-font-smoothing: antialiased; }
@@ -1273,6 +1273,7 @@ body { font-family: Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto
   font-size:18px; cursor:pointer; transition:background .15s; color:var(--dim); position:relative;
 }
 .snav { color:#9fb3c8; }
+.sidebar { border-right:1px solid var(--border); }
 .snav:hover { background:rgba(255,255,255,.1); color:#fff; }
 .snav.active { background:var(--gold); color:var(--navy); }
 .snav .stip {
@@ -1291,7 +1292,7 @@ body { font-family: Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto
   padding:14px 24px; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px;
 }
 .topbar { padding:10px 24px; }
-.topbar h1 { font-size:13px; font-weight:700; color:var(--navy); display:flex; align-items:center; gap:8px; text-transform:uppercase; letter-spacing:.06em; }
+.topbar h1 { font-size:13px; font-weight:700; color:#e6ebf2; display:flex; align-items:center; gap:8px; text-transform:uppercase; letter-spacing:.06em; }
 .topbar .meta { font-size:11.5px; color:var(--dim); display:flex; gap:16px; flex-wrap:wrap; }
 .topbar .meta span strong { color:var(--text); }
 
@@ -1306,8 +1307,8 @@ body { font-family: Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto
   margin-bottom: 4px;
 }
 .isp-card {
-  background: #fff;
-  border: 1px solid var(--border); border-radius: 12px; box-shadow: 0 1px 2px rgba(16,24,40,.04);
+  background: linear-gradient(150deg, #131d2b, #172438);
+  border: 1px solid var(--border); border-radius: 12px;
   padding: 16px 18px; position: relative; overflow: hidden;
   display: flex; flex-direction: column; gap: 8px;
 }
@@ -1364,7 +1365,7 @@ body { font-family: Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto
 }
 .lc-label {
   font-size: 13px; font-weight: 700; text-transform: uppercase;
-  letter-spacing: .7px; color: var(--navy);
+  letter-spacing: .7px; color: #e6ebf2;
 }
 .lc-sub {
   font-size: 12px; color: var(--dim); margin-top: 3px;
@@ -1405,7 +1406,7 @@ body { font-family: Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto
   content:''; position:absolute; left:0; top:0; bottom:0; width:3px;
   background: var(--accent); border-radius: 10px 0 0 10px;
 }
-.dcard-title { font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: .7px; color: var(--navy); margin-bottom: 14px; }
+.dcard-title { font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: .7px; color: #e6ebf2; margin-bottom: 14px; }
 .dcard-body  { display: flex; align-items: center; gap: 16px; flex: 1; }
 
 /* Donut (history cards) */
@@ -1428,7 +1429,7 @@ body { font-family: Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto
 
 /* ---- Section header ---- */
 .section-header { display:flex; align-items:center; gap:12px; margin-bottom:2px; }
-.section-title  { font-size:12px; font-weight:700; color:var(--navy); text-transform:uppercase; letter-spacing:.12em; }
+.section-title  { font-size:12px; font-weight:700; color:var(--gold); text-transform:uppercase; letter-spacing:.12em; }
 .section-line   { flex:1; height:1px; background:var(--border); }
 
 /* ---- Toolbar ---- */
@@ -1442,7 +1443,7 @@ body { font-family: Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto
   background:var(--card2); border:1px solid var(--border); border-radius:7px;
   padding:7px 13px; color:var(--dim); font-size:12px; cursor:pointer; transition:all .15s; white-space:nowrap;
 }
-.tb-btn.active { background:var(--accent); border-color:var(--accent); color:#fff; }
+.tb-btn.active { background:var(--accent); border-color:var(--accent); color:#0b2236; font-weight:700; }
 .tb-btn:hover:not(.active) { border-color:var(--accent); color:var(--text); }
 .tb-divider { width:1px; height:24px; background:var(--border); }
 .tb-select {
@@ -1461,42 +1462,42 @@ thead th {
   border-bottom:1px solid var(--border); cursor:pointer; user-select:none; white-space:nowrap;
   background:var(--card);
 }
-thead th:hover { color:var(--navy); }
+thead th:hover { color:var(--text); }
 thead th .arr { margin-left:3px; opacity:.3; }
 thead th.sorted .arr { opacity:1; color:var(--accent); }
 tbody tr { border-bottom:1px solid var(--border); transition:background .1s; }
 tbody tr:hover { background:var(--card2); }
 tbody tr.new-offline { animation:rowpop 2.5s ease-out forwards; }
-@keyframes rowpop { 0%{background:#fecaca} 100%{background:transparent} }
-tbody td { padding:9px 12px; color:#374151; vertical-align:middle; }
+@keyframes rowpop { 0%{background:#7f1d1d66} 100%{background:transparent} }
+tbody td { padding:9px 12px; color:#b7c4d3; vertical-align:middle; }
 
 /* Status badges */
 .badge { display:inline-flex; align-items:center; gap:5px; padding:3px 9px; border-radius:20px; font-size:11px; font-weight:600; }
 .badge::before { content:''; width:6px; height:6px; border-radius:50%; }
-.badge.online  { background:#dcfce7; color:#166534; border:1px solid #86efac; }
-.badge.offline { background:#fee2e2; color:#991b1b; border:1px solid #fecaca; }
+.badge.online  { background:#14532d55; color:#4ade80; border:1px solid #166534; }
+.badge.offline { background:#7f1d1d55; color:#f87171; border:1px solid #991b1b; }
 .badge.online::before  { background:var(--green); box-shadow:0 0 4px var(--green); }
 .badge.offline::before { background:var(--red); }
 
 .src-tag { display:inline-block; font-size:9px; padding:1px 5px; border-radius:3px; margin-left:5px; font-weight:600; vertical-align:middle; }
-.src-tag.secret { background:#e0ecff; color:#1e40af; border:1px solid #9cc1f5; }
-.src-tag.poll   { background:#fef9c3; color:#a16207; border:1px solid #fde047; }
+.src-tag.secret { background:#1e3a5f; color:#7cb8ff; border:1px solid #1e40af; }
+.src-tag.poll   { background:#2d2a1e; color:#fbbf24; border:1px solid #78350f; }
 
 .mono  { font-family:monospace; font-size:12px; }
 .bold  { font-weight:600; color:var(--text); }
 
-#error-bar { display:none; background:#fee2e2; color:#991b1b; padding:9px 24px; font-size:12px; border-bottom:1px solid #fecaca; }
+#error-bar { display:none; background:#7f1d1d; color:#fecaca; padding:9px 24px; font-size:12px; }
 #error-bar.active { display:block; }
 #no-results { text-align:center; color:var(--dim); padding:36px; font-size:13px; }
 
 /* ---- FTTH map tab ---- */
-#ftth-map { height: calc(100vh - 230px); min-height: 380px; border: 1px solid var(--border); border-radius: 12px; background: #e5e9ef; }
+#ftth-map { height: calc(100vh - 230px); min-height: 380px; border: 1px solid var(--border); border-radius: 12px; background: #1a2533; }
 .map-meta { font-size: 11.5px; color: var(--dim); white-space: nowrap; }
 .map-tools { display:flex; flex-wrap:wrap; gap:6px 14px; align-items:center; margin: 8px 0 10px; font-size: 12px; color: var(--dim); }
 .map-tools .lg { display:inline-flex; align-items:center; gap:6px; }
 .map-tools .chk { cursor:pointer; color: var(--text); font-weight:600; }
 .map-tools i { display:inline-block; }
-.dv { width:12px; height:12px; border-radius:50%; border:2px solid #fff; box-shadow:0 0 0 1px rgba(0,0,0,.25); }
+.dv { width:12px; height:12px; border-radius:50%; border:2px solid #fff; }
 .dv.nap { background:#2563eb; } .dv.olt { background:#d9b345; border-radius:3px; } .dv.spl { background:#7c3aed; }
 .hs { width:9px; height:9px; border-radius:50%; border:1.5px solid #fff; box-shadow:0 0 0 1px rgba(0,0,0,.25); }
 .hs.on { background:#16a34a; } .hs.off { background:#dc2626; } .hs.na { background:#94a3b8; }
@@ -1859,7 +1860,7 @@ function drawDonut(svgId, good, bad, total) {
   const sw = isLarge ? 18 : 11;
 
   const circ = 2 * Math.PI * r;
-  const track = \`<circle cx="\${cx}" cy="\${cy}" r="\${r}" fill="none" stroke="#e5e7eb" stroke-width="\${sw}"/>\`;
+  const track = \`<circle cx="\${cx}" cy="\${cy}" r="\${r}" fill="none" stroke="#233246" stroke-width="\${sw}"/>\`;
 
   if (total === 0) {
     svg.innerHTML = track;
@@ -1872,14 +1873,14 @@ function drawDonut(svgId, good, bad, total) {
   const goodDash  = goodRatio * circ;
 
   const badArc = bad > 0
-    ? \`<circle cx="\${cx}" cy="\${cy}" r="\${r}" fill="none" stroke="#dc2626" stroke-width="\${sw}"
+    ? \`<circle cx="\${cx}" cy="\${cy}" r="\${r}" fill="none" stroke="#ef4444" stroke-width="\${sw}"
         stroke-dasharray="\${badDash} \${circ - badDash}"
         transform="rotate(-90 \${cx} \${cy})"/>\`
     : '';
 
   const greenRotate = -90 + (badRatio * 360);
   const goodArc = good > 0
-    ? \`<circle cx="\${cx}" cy="\${cy}" r="\${r}" fill="none" stroke="#16a34a" stroke-width="\${sw}"
+    ? \`<circle cx="\${cx}" cy="\${cy}" r="\${r}" fill="none" stroke="#22c55e" stroke-width="\${sw}"
         stroke-dasharray="\${goodDash} \${circ - goodDash}"
         transform="rotate(\${greenRotate} \${cx} \${cy})"/>\`
     : '';
