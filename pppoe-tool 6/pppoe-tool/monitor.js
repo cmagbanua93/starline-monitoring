@@ -194,7 +194,7 @@ let state = {
   alertSince: null,
   lastPoll: null,
   pollError: null,
-  routerHost: `${SSH_HOST}:${SSH_PORT} (SSH)`,
+  routerHost: 'Main router',   // the router's real address stays on the server (it is not shown to anyone)
   pollIntervalSec: Math.round(POLL_INTERVAL_MS / 1000),
   alertThreshold: ALERT_THRESHOLD,
   billingEnabled: BILLING_ENABLED,
@@ -1151,7 +1151,7 @@ async function pollRouter() {
     broadcast();
   } catch (err) {
     const msg = describeFetchError(err);
-    state = { ...state, pollError: msg, lastPoll: new Date().toISOString() };
+    state = { ...state, pollError: hideRouterAddress(msg), lastPoll: new Date().toISOString() };
     broadcast();
     console.error(`[${new Date().toISOString()}] Poll error:`, msg);
   }
@@ -1184,6 +1184,16 @@ function broadcast() {
   for (const client of sseClients) {
     try { client.write(payload); } catch {}
   }
+}
+
+/* The router's address and port never reach a browser: replace them (and any
+   IP:port pair) in messages shown on the dashboard. */
+function hideRouterAddress(text) {
+  let t = String(text || '');
+  if (SSH_HOST) t = t.split(SSH_HOST).join('the router');
+  t = t.replace(new RegExp(':' + SSH_PORT + '\\b', 'g'), '');
+  t = t.replace(/\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b/g, 'the router');
+  return t;
 }
 
 // ---------- Dashboard HTML ----------
@@ -1581,7 +1591,7 @@ tbody td { padding:9px 12px; color:#b7c4d3; vertical-align:middle; }
 
     <!-- Top bar -->
     <div class="topbar">
-      <h1>Live status <span style="font-size:12px;color:var(--dim);font-weight:400;text-transform:none;letter-spacing:0" id="tb-host"></span></h1>
+      <h1>Live status</h1>
       <div class="meta">
         <span>Last poll: <strong id="tb-poll">—</strong></span>
         <span>Next: <strong id="tb-next">—</strong>s</span>
@@ -1925,8 +1935,7 @@ function render(data) {
   } else { banner.classList.remove('active'); stopAlarm(); }
   wasAlert = data.alertActive;
 
-  document.getElementById('tb-host').textContent     = data.routerHost;
-  if (document.getElementById('lc-router')) document.getElementById('lc-router').textContent = data.routerHost;
+  if (document.getElementById('lc-router')) document.getElementById('lc-router').textContent = 'From the main router · every ' + (data.pollIntervalSec || 30) + ' s';
   document.getElementById('tb-poll').textContent     = fmt(data.lastPoll);
   document.getElementById('tb-interval').textContent = data.pollIntervalSec;
   document.getElementById('tb-thresh').textContent   = data.alertThreshold;
