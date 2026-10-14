@@ -316,6 +316,10 @@ function parseTerse(output) {
     // 09:10:00`), which breaks the generic key=value split below —
     // normalize any such field to a quoted value first so it parses as
     // one field instead of two.
+    /* Flag letters sit between the record number and the first key: " 12 X name=…".
+       X = disabled (billing cut it for non-payment). Kept as __flags. */
+    const flagMatch = line.match(/^\d+\s+([A-Z ]*?)\s*(?=[a-z][a-z0-9-]*=)/);
+    const flags = flagMatch ? flagMatch[1].replace(/\s+/g, '') : '';
     line = line.replace(/([\w-]+)=([a-z]{3}\/\d{1,2}\/\d{4}) (\d{2}:\d{2}:\d{2})/gi, '$1="$2 $3"');
     line = line.replace(/([\w-]+)=(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2})/g, '$1="$2 $3"');
     const fields = {};
@@ -326,7 +330,7 @@ function parseTerse(output) {
       if (val.startsWith('"') && val.endsWith('"')) val = val.slice(1, -1).replace(/\\"/g, '"');
       fields[m[1]] = val;
     }
-    if (Object.keys(fields).length) rows.push(fields);
+    if (Object.keys(fields).length) { fields.__flags = flags; rows.push(fields); }
   }
   return rows;
 }
@@ -1049,10 +1053,14 @@ async function pollRouter() {
       const username = secret.name;
       if (!username) continue;
 
-      const active   = activeByName.get(username);
+      /* Disabled on the router = billing cut the account for non-payment. That is
+         not an outage: it gets its own status so it never counts as "offline",
+         never trips the alarm and never makes a NAP box look broken. */
+      const isDisabled = /X/.test(secret.__flags || '') || secret.disabled === 'yes' || secret.disabled === 'true';
+      const active   = isDisabled ? null : activeByName.get(username);
       const isOnline = Boolean(active);
       const prev     = prevByUsername.get(username);
-      const justWentOffline = !isOnline && prev && prev.status === 'online';
+      const justWentOffline = !isOnline && !isDisabled && prev && prev.status === 'online';
 
       // RouterOS tracks this per-secret already — same value shown in
       // Winbox under PPP > Secrets > Last Logged Out. Far more reliable
@@ -1097,7 +1105,8 @@ async function pollRouter() {
         comment: secret.comment || '',
         localIp: secret['local-address'] || '',
         remoteIp: isOnline ? (active.address || secret['remote-address'] || '') : (secret['remote-address'] || ''),
-        status: isOnline ? 'online' : 'offline',
+        status: isDisabled ? 'disabled' : (isOnline ? 'online' : 'offline'),
+        disabled: isDisabled,
         lastSeen: isOnline ? now.toISOString() : (prev ? prev.lastSeen : null),
         lastLogout,
         logSource,
@@ -1117,8 +1126,9 @@ async function pollRouter() {
     }
 
     // Default sort: offline (most recently logged out) first
+    const ORDER = { offline: 0, online: 1, disabled: 2 };
     updated.sort((a, b) => {
-      if (a.status !== b.status) return a.status === 'offline' ? -1 : 1;
+      if (a.status !== b.status) return ORDER[a.status] - ORDER[b.status];
       if (a.status === 'offline') {
         const ta = a.lastLogout ? new Date(a.lastLogout).getTime() : 0;
         const tb = b.lastLogout ? new Date(b.lastLogout).getTime() : 0;
@@ -1128,6 +1138,7 @@ async function pollRouter() {
     });
 
     const downCount = updated.filter(a => a.status === 'offline').length;
+    const disabledCount = updated.filter(a => a.status === 'disabled').length;
 
     const todayStr = now.toDateString();
     const todayDownCount = updated.filter(a =>
@@ -1142,6 +1153,7 @@ async function pollRouter() {
       ...state,
       accounts: updated,
       downCount,
+      disabledCount,
       todayDownCount,
       totalCount: updated.length,
       alertActive,
@@ -1506,7 +1518,7 @@ tbody td { padding:9px 12px; color:#b7c4d3; vertical-align:middle; }
 #no-results { text-align:center; color:var(--dim); padding:36px; font-size:13px; }
 
 /* ---- summary row ---- */
-.kpis { display:grid; grid-template-columns: repeat(6, minmax(0,1fr)); gap:10px; margin-bottom: 18px; }
+.kpis { display:grid; grid-template-columns: repeat(7, minmax(0,1fr)); gap:10px; margin-bottom: 18px; }
 .kpi { background: var(--card); border:1px solid var(--border); border-radius:10px; padding:12px 14px; text-align:left;
   display:flex; flex-direction:column; gap:3px; color: var(--text); font: inherit; cursor: default; }
 button.kpi { cursor:pointer; } button.kpi:hover { border-color: var(--accent); }
@@ -1540,6 +1552,29 @@ button.kpi { cursor:pointer; } button.kpi:hover { border-color: var(--accent); }
 .ev-d { width:9px; height:9px; border-radius:50%; margin-top:4px; }
 .ev-d.down { background: var(--red); } .ev-d.up { background: var(--green); }
 .ev-d.isp-down, .ev-d.nap { background: var(--amber); } .ev-d.isp-up, .ev-d.nap-ok { background: var(--isp-up); }
+.ev-d.cut { background: var(--unpaid); } .ev-d.paid { background: var(--green); box-shadow: 0 0 0 2px #121a25, 0 0 0 3px var(--green); }
+
+/* ---- non-payment panel ---- */
+:root { --unpaid: #a78bfa; }
+.kpi-n.unpaid, .lc-stat-n.unpaid { color: var(--unpaid); }
+.cut-panel { margin-bottom: 14px; }
+.cut-sum { display:grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap:10px; margin-bottom: 10px; }
+.cs { background: var(--card2); border:1px solid var(--border); border-radius:8px; padding:9px 12px; }
+.cs b { display:block; font-size:22px; font-weight:700; color:#e6ebf2; font-variant-numeric: tabular-nums; }
+.cs b.good { color: var(--green); } .cs b.bad { color: var(--unpaid); }
+.cs span { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: .4px; }
+.cut-bar { display:flex; gap:2px; height:8px; border-radius:4px; overflow:hidden; margin-bottom: 12px; background: var(--card2); }
+.cut-bar i { display:block; height:100%; } .cut-bar i.good { background: var(--green); } .cut-bar i.bad { background: var(--unpaid); }
+.cut-search { width: 100%; max-width: 360px; margin-bottom: 8px; }
+.cut-list { max-height: 340px; overflow-y: auto; }
+.cut-table { width:100%; border-collapse: collapse; font-size: 12.5px; }
+.cut-table th { text-align:left; font-size:10px; text-transform:uppercase; letter-spacing:.5px; color: var(--dim); padding:6px 8px; border-bottom:1px solid var(--border); position: sticky; top: 0; background: var(--card); }
+.cut-table td { padding:7px 8px; border-bottom:1px solid var(--border); color:#c9d4e0; vertical-align: top; }
+.cut-table tbody tr { cursor:pointer; } .cut-table tbody tr:hover { background: var(--card2); }
+.cut-table b { color:#e6ebf2; font-weight:600; }
+.dimt { color: var(--dim); font-size: 11px; }
+.badge.disabled { background:#4c1d9533; color:#c4b5fd; border:1px solid #6d28d9; }
+.badge.disabled::before { background: var(--unpaid); }
 .ev-x { color: #c9d4e0; overflow-wrap:anywhere; } .ev-x b { color:#e6ebf2; }
 .ev-day { font-size:10.5px; color: var(--dim); text-transform:uppercase; letter-spacing:.5px; padding:8px 2px 2px; }
 
@@ -1574,7 +1609,7 @@ button.kpi { cursor:pointer; } button.kpi:hover { border-color: var(--accent); }
 .dv { width:12px; height:12px; border-radius:50%; border:2px solid #fff; }
 .dv.nap { background:#2563eb; } .dv.olt { background:#d9b345; border-radius:3px; } .dv.spl { background:#7c3aed; }
 .hs { width:9px; height:9px; border-radius:50%; border:1.5px solid #fff; box-shadow:0 0 0 1px rgba(0,0,0,.25); }
-.hs.on { background:#16a34a; } .hs.off { background:#dc2626; } .hs.na { background:#94a3b8; }
+.hs.on { background:#16a34a; } .hs.off { background:#dc2626; } .hs.cut { background:#a78bfa; } .hs.na { background:#94a3b8; }
 .ln { width:22px; height:3px; border-radius:2px; background:#3b82f6; } .ln.cut { background: repeating-linear-gradient(90deg,#dc2626 0 4px,transparent 4px 7px); }
 .map-note { font-size: 11.5px; color: var(--dim); margin-top: 8px; }
 .ftth-down { position:absolute; left:16px; top:-26px; white-space:nowrap; background:#ef4444; color:#fff; font: 700 11px Inter, sans-serif; padding:2px 7px; border-radius:99px; box-shadow:0 1px 4px rgba(0,0,0,.4); pointer-events:none; }
@@ -1587,7 +1622,7 @@ button.kpi { cursor:pointer; } button.kpi:hover { border-color: var(--accent); }
 
 /* ---- Mobile ---- */
 @media (max-width: 1100px) {
-  .kpis { grid-template-columns: repeat(3, minmax(0,1fr)); }
+  .kpis { grid-template-columns: repeat(4, minmax(0,1fr)); }
 }
 @media (max-width: 900px) {
   .insight-row { grid-template-columns: 1fr; }
@@ -1613,6 +1648,8 @@ button.kpi { cursor:pointer; } button.kpi:hover { border-color: var(--accent); }
   .history-grid { grid-template-columns: 1fr; grid-template-rows: none; gap: 10px; }
   .kpis { grid-template-columns: repeat(2, minmax(0,1fr)); gap: 8px; }
   .kpi { padding: 10px 12px; } .kpi-n { font-size: 22px; }
+  .cut-sum { grid-template-columns: repeat(2, minmax(0,1fr)); }
+  .cut-table th:nth-child(3), .cut-table td:nth-child(3) { display: none; }
   .trend-chart { height: 160px; }
   #ftth-map { height: calc(100vh - 260px); }
   .lc-donut-wrap svg { width: 140px; height: 140px; }
@@ -1689,6 +1726,7 @@ button.kpi { cursor:pointer; } button.kpi:hover { border-color: var(--accent); }
           <div class="kpi"><span class="kpi-n" id="k-avail">—</span><span class="kpi-l">Connected</span></div>
           <div class="kpi"><span class="kpi-n" id="k-isp">—</span><span class="kpi-l">ISP links up</span></div>
           <button class="kpi" onclick="document.getElementById('nap-panel').scrollIntoView({behavior:'smooth',block:'center'})" title="Jump to NAP outages"><span class="kpi-n" id="k-nap">—</span><span class="kpi-l">NAP alerts</span></button>
+          <button class="kpi" onclick="document.getElementById('cut-panel').scrollIntoView({behavior:'smooth',block:'center'})" title="Jump to non-payment disconnections"><span class="kpi-n unpaid" id="k-cut">—</span><span class="kpi-l">Cut for non-payment today</span></button>
         </div>
 
         <div class="section-header"><span class="section-title">ISP Links</span><div class="section-line"></div><span class="sec-note">latency, last 24 h</span></div>
@@ -1708,9 +1746,26 @@ button.kpi { cursor:pointer; } button.kpi:hover { border-color: var(--accent); }
                 <button class="chip-f" data-f="down" onclick="setFeedFilter('down')">Down</button>
                 <button class="chip-f" data-f="up" onclick="setFeedFilter('up')">Back</button>
                 <button class="chip-f" data-f="net" onclick="setFeedFilter('net')">ISP &amp; NAP</button>
+                <button class="chip-f" data-f="pay" onclick="setFeedFilter('pay')">Unpaid</button>
               </span></div>
             <div id="feed-list" class="feed-list"><div class="empty">No events yet — they appear as subscribers go offline or come back.</div></div>
           </div>
+        </div>
+
+        <!-- Non-payment disconnections -->
+        <div class="panel cut-panel" id="cut-panel">
+          <div class="panel-h"><span class="section-title">Disconnected for non-payment</span>
+            <span class="chips" id="cut-chips">
+              <button class="chip-f active" data-s="today" onclick="setCutsScope('today')">Today</button>
+              <button class="chip-f" data-s="still" onclick="setCutsScope('still')">Still disconnected</button>
+              <button class="chip-f" data-s="paid" onclick="setCutsScope('paid')">Paid &amp; reconnected</button>
+              <button class="chip-f" data-s="all" onclick="setCutsScope('all')">All disabled</button>
+            </span></div>
+          <div class="cut-sum" id="cut-sum"></div>
+          <div class="cut-bar" id="cut-bar"></div>
+          <input class="tb-input cut-search" id="cut-search" type="text" placeholder="Search name, username, account #, area…" oninput="renderCuts()">
+          <div class="cut-list" id="cut-list"><div class="empty">Loading…</div></div>
+          <div class="sec-note" style="margin-top:8px;white-space:normal">Accounts the billing system disabled on the router. They are kept out of the offline count, the outage alarm and the NAP alerts.</div>
         </div>
 
         <!-- 24-hour trend -->
@@ -1744,6 +1799,10 @@ button.kpi { cursor:pointer; } button.kpi:hover { border-color: var(--accent); }
               <div class="lc-stat">
                 <div class="lc-stat-n red" id="cn-live-off">—</div>
                 <div class="lc-stat-l">🔴 Offline</div>
+              </div>
+              <div class="lc-stat">
+                <div class="lc-stat-n unpaid" id="cn-live-dis">—</div>
+                <div class="lc-stat-l">⛔ Unpaid</div>
               </div>
             </div>
           </div>
@@ -1824,6 +1883,7 @@ button.kpi { cursor:pointer; } button.kpi:hover { border-color: var(--accent); }
           <button class="tb-btn active" id="btn-all"     onclick="setFilter('all')">All</button>
           <button class="tb-btn"        id="btn-online"  onclick="setFilter('online')">🟢 Online</button>
           <button class="tb-btn"        id="btn-offline" onclick="setFilter('offline')">🔴 Offline</button>
+          <button class="tb-btn"        id="btn-disabled" onclick="setFilter('disabled')" title="Disabled in billing for non-payment">⛔ Unpaid</button>
         </span>
         <div class="tb-divider"></div>
         <label class="tb-label">Sort:</label>
@@ -1878,6 +1938,7 @@ button.kpi { cursor:pointer; } button.kpi:hover { border-color: var(--accent); }
           <span class="lg"><i class="dv spl"></i>Splitter / joint</span>
           <span class="lg"><i class="hs on"></i>House online</span>
           <span class="lg"><i class="hs off"></i>House offline</span>
+          <span class="lg"><i class="hs cut"></i>Unpaid (disabled)</span>
           <span class="lg"><i class="hs na"></i>Not in router</span>
           <span class="lg"><i class="ln"></i>Fiber</span>
           <span class="lg"><i class="ln cut"></i>Cut</span>
@@ -2069,19 +2130,20 @@ function render(data) {
 
 // ---- Update donut cards ----
 function updateCards() {
-  const total   = allAccounts.length;
   const online  = allAccounts.filter(a=>a.status==='online').length;
   const offline = allAccounts.filter(a=>a.status==='offline').length;
+  const total   = online + offline;          // active subscribers; non-payment cuts shown separately
 
   // Live card — true current counts, so the donut always adds up to total
   document.getElementById('dn-live').textContent    = total;
   document.getElementById('cn-live-on').textContent  = online;
   document.getElementById('cn-live-off').textContent = offline;
+  document.getElementById('cn-live-dis').textContent = allAccounts.length - total;
   drawDonut('svg-live', online, offline, total);
 
   // Period cards
   ['today','week','month','year'].forEach(p => {
-    const inP    = allAccounts.filter(a => a.lastLogout && inPeriod(a.lastLogout, p));
+    const inP    = allAccounts.filter(a => a.status !== 'disabled' && a.lastLogout && inPeriod(a.lastLogout, p));
     const pTotal = inP.length;
     const pDown  = inP.filter(a=>a.status==='offline').length;
     const pBack  = pTotal - pDown;
@@ -2130,6 +2192,7 @@ function setView(v) {
 function napGroups(accounts) {
   var groups = {}, order = [];
   (accounts || []).forEach(function (a) {
+    if (a.status === 'disabled') return;
     var nap = String(a.area || String(a.napBox || '').split(' / ')[0] || '').trim();
     if (!nap) return;
     var g = groups[nap];
@@ -2154,9 +2217,10 @@ function napGroups(accounts) {
 
 var LAST_ISPS = [];
 function updateInsights() {
-  var total = allAccounts.length;
   var on = allAccounts.filter(function (a) { return a.status === 'online'; }).length;
-  var off = total - on;
+  var off = allAccounts.filter(function (a) { return a.status === 'offline'; }).length;
+  var total = on + off;                     // non-payment cuts are not part of "connected"
+  if (CUTS) renderCuts();
   var today = allAccounts.filter(function (a) { return a.status === 'offline' && a.lastLogout && inPeriod(a.lastLogout, 'today'); }).length;
   var groups = napGroups(allAccounts);
   var suspected = groups.filter(function (g) { return g.suspected; }).length;
@@ -2229,7 +2293,7 @@ function setFeedFilter(f) {
 }
 function renderFeed() {
   var box = document.getElementById('feed-list');
-  var match = { all: null, down: ['down'], up: ['up'], net: ['isp-down', 'isp-up', 'nap', 'nap-ok'] }[FEED_FILTER];
+  var match = { all: null, down: ['down'], up: ['up'], net: ['isp-down', 'isp-up', 'nap', 'nap-ok'], pay: ['cut', 'paid'] }[FEED_FILTER];
   var list = FEED.filter(function (e) { return !match || match.indexOf(e.kind) !== -1; }).slice().reverse().slice(0, 120);
   if (!list.length) { box.innerHTML = '<div class="empty">' + (FEED.length ? 'Nothing of this kind yet.' : 'No events yet — they appear as subscribers go offline or come back.') + '</div>'; return; }
   var html = '', lastDay = '';
@@ -2370,6 +2434,84 @@ setInterval(loadTrend, 5 * 60000);
 setTimeout(function () { loadFeed(); loadTrend(); }, 300);
 
 
+// ---- Non-payment disconnections ----
+// Accounts billing disabled on the router (usually the midnight run). "Today" is
+// counted from midnight minus 2 hours, so a batch that starts at 11:58 PM still
+// belongs to the day it was meant for.
+var CUTS = null, CUTS_SCOPE = 'today';
+function dayStart() { var d = new Date(); d.setHours(0, 0, 0, 0); return d.getTime() - 2 * 3600e3; }
+function loadCuts() {
+  if (document.hidden) return;
+  fetch('/api/cuts', { credentials: 'same-origin' }).then(function (r) { return r.ok ? r.json() : null; }).then(function (d) {
+    if (!d) return;
+    CUTS = d; renderCuts();
+  }).catch(function () {});
+}
+function setCutsScope(sc) {
+  CUTS_SCOPE = sc;
+  document.querySelectorAll('#cut-chips .chip-f').forEach(function (b) { b.classList.toggle('active', b.dataset.s === sc); });
+  renderCuts();
+}
+function renderCuts() {
+  if (!CUTS) return;
+  var start = dayStart();
+  var today = CUTS.list.filter(function (c) { return new Date(c.cutAt).getTime() >= start; });
+  var paidToday = today.filter(function (c) { return c.backAt; });
+  var still = today.length - paidToday.length;
+  var disabledNow = allAccounts.length ? allAccounts.filter(function (a) { return a.status === 'disabled'; }).length : CUTS.disabledNow;
+
+  document.getElementById('k-cut').textContent = today.length;
+  document.getElementById('cut-sum').innerHTML =
+    '<div class="cs"><b>' + today.length + '</b><span>cut today</span></div>' +
+    '<div class="cs"><b class="good">' + paidToday.length + '</b><span>paid &amp; reconnected</span></div>' +
+    '<div class="cs"><b class="bad">' + still + '</b><span>still disconnected</span></div>' +
+    '<div class="cs"><b>' + disabledNow + '</b><span>disabled in total</span></div>';
+  var bar = document.getElementById('cut-bar');
+  bar.innerHTML = today.length
+    ? '<i class="good" style="width:' + (paidToday.length / today.length * 100) + '%"></i><i class="bad" style="width:' + (still / today.length * 100) + '%"></i>'
+    : '';
+  bar.title = today.length ? Math.round(paidToday.length / today.length * 100) + '% of today’s cuts have paid and been reconnected' : '';
+
+  var q = (document.getElementById('cut-search').value || '').trim().toLowerCase();
+  var rows;
+  if (CUTS_SCOPE === 'all') {
+    rows = allAccounts.filter(function (a) { return a.status === 'disabled'; }).map(function (a) {
+      var c = CUTS.list.filter(function (x) { return x.username === a.username; })[0];
+      return { username: a.username, name: a.customerName, accountNo: a.accountNo, area: a.area, cutAt: c ? c.cutAt : a.lastLogout, backAt: null };
+    }).sort(function (x, y) { return new Date(y.cutAt || 0) - new Date(x.cutAt || 0); });
+  } else if (CUTS_SCOPE === 'paid') rows = paidToday;
+  else if (CUTS_SCOPE === 'still') rows = today.filter(function (c) { return !c.backAt; });
+  else rows = today;
+  if (q) rows = rows.filter(function (c) { return [c.username, c.name, c.accountNo, c.area].join(' ').toLowerCase().indexOf(q) !== -1; });
+
+  var box = document.getElementById('cut-list');
+  if (!rows.length) {
+    box.innerHTML = '<div class="empty">' + (q ? 'No match.' : CUTS_SCOPE === 'all' ? 'No accounts are disabled right now.' :
+      'No accounts disconnected for non-payment today' + (CUTS_SCOPE === 'today' ? ' — the nightly run usually happens around 12 AM.' : '.')) + '</div>';
+    return;
+  }
+  box.innerHTML = '<table class="cut-table"><thead><tr><th>Customer</th><th>Account #</th><th>Area / NAP</th><th>Cut at</th><th>Now</th></tr></thead><tbody>' +
+    rows.slice(0, 300).map(function (c) {
+      var when = c.cutAt ? new Date(c.cutAt) : null;
+      var whenTxt = when ? (when.getTime() >= start ? '' : when.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ') + when.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '—';
+      var now = c.backAt
+        ? '<span class="badge online">paid</span> <span class="dimt">' + new Date(c.backAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + '</span>'
+        : '<span class="badge disabled">disconnected</span>';
+      return '<tr onclick="cutClick(this.dataset.u)" data-u="' + esc(c.username) + '" title="Show in the account list">' +
+        '<td><b>' + esc(c.name || '—') + '</b><div class="dimt mono">' + esc(c.username) + '</div></td>' +
+        '<td class="mono">' + esc(c.accountNo || '—') + '</td><td>' + esc(c.area || '—') + '</td>' +
+        '<td class="mono">' + whenTxt + '</td><td>' + now + '</td></tr>';
+    }).join('') + '</tbody></table>' + (rows.length > 300 ? '<div class="empty">Showing 300 of ' + rows.length + ' — use the search box.</div>' : '');
+}
+function cutClick(u) {
+  selectCard('live'); setFilter('all');
+  document.getElementById('search').value = u; applyDisplay(); scrollToTable();
+}
+setInterval(loadCuts, 60000);
+document.addEventListener('visibilitychange', function () { if (!document.hidden) loadCuts(); });
+setTimeout(loadCuts, 400);
+
+
 // ---- FTTH map tab (view only) ----
 // Leaflet is loaded the first time the tab opens. Every marker and line is
 // non-interactive: no popups, no clicks — the map shows positions only.
@@ -2410,7 +2552,8 @@ async function refreshFtth() {
     if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
     ftthData = d;
     const off = d.subs.filter(x => x.st === 'off').length;
-    meta.textContent = d.devices.length + ' boxes · ' + d.subs.length + ' houses' + (off ? ' · ' + off + ' offline' : '') + ' · updated ' + new Date().toLocaleTimeString();
+    const cut = d.subs.filter(x => x.st === 'cut').length;
+    meta.textContent = d.devices.length + ' boxes · ' + d.subs.length + ' houses' + (off ? ' · ' + off + ' offline' : '') + (cut ? ' · ' + cut + ' unpaid' : '') + ' · updated ' + new Date().toLocaleTimeString();
     drawFtth();
     if (!ftthFitted) {
       const pts = d.devices.map(x => [x.la, x.lo]);
@@ -2431,7 +2574,7 @@ function drawFtth() {
   })).addTo(ftthLayer));
   if (houses) ftthData.subs.forEach(h => L.circleMarker([h.la, h.lo], Object.assign({}, opt, {
     radius: 4.5, color: '#fff', weight: 1.5, fillOpacity: 1,
-    fillColor: h.st === 'on' ? '#16a34a' : h.st === 'off' ? '#dc2626' : '#94a3b8',
+    fillColor: h.st === 'on' ? '#16a34a' : h.st === 'off' ? '#dc2626' : h.st === 'cut' ? '#a78bfa' : '#94a3b8',
   })).addTo(ftthLayer));
   /* boxes with subscribers down: amber ring; suspected box / fiber problem: red ring + count */
   const napDown = {};
@@ -2457,7 +2600,7 @@ function drawFtth() {
 // ---- Filter ----
 function setFilter(f) {
   currentFilter = f;
-  ['all','online','offline'].forEach(id => document.getElementById('btn-'+id).classList.toggle('active', id===f));
+  ['all','online','offline','disabled'].forEach(id => document.getElementById('btn-'+id).classList.toggle('active', id===f));
   applyDisplay();
 }
 
@@ -2607,11 +2750,13 @@ function publicAccount(a) {
    one subscriber's drop wire, or is the whole NAP dark? */
 function napContext(napName) {
   if (!napName) return null;
-  const peers = state.accounts.filter(a => napNameOf(a.napBox) === napName);
+  const all = state.accounts.filter(a => napNameOf(a.napBox) === napName);
+  const peers = all.filter(a => a.status !== 'disabled');      // cut for non-payment: not part of a box fault
   if (!peers.length) return null;
   const offline = peers.filter(a => a.status === 'offline');
   return {
     napName,
+    disabled: all.length - peers.length,
     total:   peers.length,
     offline: offline.length,
     online:  peers.length - offline.length,
@@ -2673,7 +2818,7 @@ async function ftthMapView() {
   for (const sub of net.subscribers || []) {
     if (sub.lat == null || sub.lng == null) continue;
     const st = live.get(String(sub.pppoe_username || '').toLowerCase());
-    subs.push({ la: r6(sub.lat), lo: r6(sub.lng), st: st === 'online' ? 'on' : st === 'offline' ? 'off' : 'na' });
+    subs.push({ la: r6(sub.lat), lo: r6(sub.lng), st: st === 'online' ? 'on' : st === 'offline' ? 'off' : st === 'disabled' ? 'cut' : 'na' });
   }
   return { devices, links, subs, at: new Date(ftthCache.at).toISOString() };
 }
@@ -2743,6 +2888,12 @@ async function handleRequest(req, res) {
     if (!FTTH_URL || !FTTH_TOKEN) return send(503, { error: 'The FTTH map is not linked to the monitor (FTTH_URL / FTTH_TOKEN).' });
     try { return send(200, await ftthMapView()); }
     catch (e) { return send(502, { error: describeFetchError ? describeFetchError(e) : e.message }); }
+  }
+
+  /* accounts cut for non-payment: who, when, and who has paid and come back */
+  if (path === '/api/cuts') {
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+    return res.end(JSON.stringify(insights.cutsView(state.accounts)));
   }
 
   /* events feed (incremental), 24 h trend, NAP outage groups — any signed-in user */
@@ -2919,7 +3070,7 @@ async function handleRequest(req, res) {
     const byNap = new Map();
     const byArea = new Map();
     const bump = (map, key, account, partnerKey, partnerField) => {
-      if (!key) return;
+      if (!key || account.status === 'disabled') return;
       if (!map.has(key)) map.set(key, { customers: 0, offline: 0, partners: new Set() });
       const row = map.get(key);
       row.customers += 1;

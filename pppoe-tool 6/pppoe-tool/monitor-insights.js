@@ -22,6 +22,11 @@ let events = [];          // newest last; { seq, t, kind, text, user?, nap? }
 let seq = 0;
 let buckets = [];         // oldest first; { t, on, off, n, isp: { name: [sum, count, downCount] } }
 let activeIncidents = new Map();   // nap -> since (ISO) for "suspected" NAPs already announced
+/* Non-payment cuts: username -> { cutAt, seen, backAt }.
+   seen = true when the monitor watched it happen; otherwise cutAt is the router's
+   "last logged out" time (billing ends the session when it disables the account). */
+let cuts = new Map();
+const KEEP_CUTS_MS = 8 * 24 * 3600e3;
 let pool = null;
 let dirty = false;
 
@@ -38,6 +43,7 @@ const napOf = (a) => String(a.area || String(a.napBox || '').split(' / ')[0] || 
 
 /* Called after every router poll with the previous and new account lists. */
 function onAccounts(prev, next) {
+  trackCuts(prev, next);
   if (prev && prev.length) {
     const before = new Map(prev.map(a => [a.username, a.status]));
     const downs = [], ups = [];
@@ -66,11 +72,59 @@ function onAccounts(prev, next) {
     if (!suspectedNow.has(nap)) { activeIncidents.delete(nap); addEvent('nap-ok', `${nap} recovered`, { nap }); }
   }
 
-  /* trend bucket */
+  /* trend bucket — non-payment cuts are kept out of "offline" */
   const on = next.filter(a => a.status === 'online').length;
+  const off = next.filter(a => a.status === 'offline').length;
   const b = currentBucket();
-  b.on += on; b.off += next.length - on; b.n += 1;
+  b.on += on; b.off += off; b.dis = (b.dis || 0) + (next.length - on - off); b.n += 1;
   dirty = true;
+}
+
+function trackCuts(prev, next) {
+  const now = new Date().toISOString();
+  const before = new Map((prev || []).map(a => [a.username, a.status]));
+  const watching = before.size > 0;      // false on the first poll after a restart
+  const newlyCut = [], paid = [];
+  for (const a of next) {
+    const c = cuts.get(a.username);
+    if (a.status === 'disabled') {
+      if (!c || c.backAt) {
+        const seen = watching && before.has(a.username) && before.get(a.username) !== 'disabled';
+        const cutAt = seen ? now : (a.lastLogout || null);
+        if (!cutAt) continue;                                        // disabled long ago, no date: nothing to show
+        cuts.set(a.username, { cutAt, seen });
+        if (seen) newlyCut.push(a);
+      }
+    } else if (c && !c.backAt) {
+      c.backAt = now;
+      c.backSeen = watching && before.get(a.username) === 'disabled';
+      if (c.backSeen) paid.push(a);
+    }
+  }
+  if (newlyCut.length > 15) addEvent('cut', `${newlyCut.length} accounts disconnected for non-payment`, { count: newlyCut.length });
+  else newlyCut.forEach(a => addEvent('cut', `${label(a)} disconnected for non-payment`, { user: a.username }));
+  if (paid.length > 15) addEvent('paid', `${paid.length} accounts reconnected after payment`, { count: paid.length });
+  else paid.forEach(a => addEvent('paid', `${label(a)} reconnected (paid)`, { user: a.username }));
+  const cutoff = Date.now() - KEEP_CUTS_MS;
+  for (const [u, c] of cuts) if (new Date(c.backAt || c.cutAt).getTime() < cutoff) cuts.delete(u);
+  if (newlyCut.length || paid.length) dirty = true;
+}
+
+/* For the dashboard: cuts of the last 36 h (the page decides what "today" is in
+   the viewer's own time zone) plus totals. */
+function cutsView(accounts) {
+  const byUser = new Map((accounts || []).map(a => [a.username, a]));
+  const since = Date.now() - 36 * 3600e3;
+  const list = [];
+  for (const [u, c] of cuts) {
+    const cutT = new Date(c.cutAt).getTime(), backT = c.backAt ? new Date(c.backAt).getTime() : 0;
+    if (cutT < since && backT < since) continue;
+    const a = byUser.get(u) || {};
+    list.push({ username: u, name: a.customerName || '', accountNo: a.accountNo || '', area: a.area || '',
+      contactNo: a.contactNo || '', cutAt: c.cutAt, seen: !!c.seen, backAt: c.backAt || null, nowStatus: a.status || 'unknown' });
+  }
+  list.sort((x, y) => new Date(y.cutAt) - new Date(x.cutAt));
+  return { disabledNow: (accounts || []).filter(a => a.status === 'disabled').length, list };
 }
 
 /* Called after every ISP ping round. */
@@ -107,6 +161,7 @@ function currentBucket() {
 function napOutages(accounts) {
   const groups = new Map();
   for (const a of accounts || []) {
+    if (a.status === 'disabled') continue;          // cut for non-payment — not a box problem
     const nap = napOf(a);
     if (!nap) continue;
     let g = groups.get(nap);
@@ -150,6 +205,7 @@ function trend() {
       t: b.t,
       on: b.n ? Math.round(b.on / b.n) : null,
       off: b.n ? Math.round(b.off / b.n) : null,
+      dis: b.n && b.dis != null ? Math.round(b.dis / b.n) : null,
       isp: Object.fromEntries(Object.entries(b.isp).map(([k, v]) => [k, v[1] ? Math.round(v[0] / v[1]) : (v[2] ? -1 : null)])),
     })),
   };
@@ -162,12 +218,13 @@ async function init(dbPool) {
   try {
     await pool.query(`CREATE SCHEMA IF NOT EXISTS monitor;
       CREATE TABLE IF NOT EXISTS monitor.kv (key text PRIMARY KEY, value jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now());`);
-    const r = await pool.query(`SELECT key, value FROM monitor.kv WHERE key IN ('events','trend')`);
+    const r = await pool.query(`SELECT key, value FROM monitor.kv WHERE key IN ('events','trend','cuts')`);
     for (const row of r.rows) {
       if (row.key === 'events' && Array.isArray(row.value.events)) {
         events = row.value.events.slice(-KEEP_EVENTS); seq = Number(row.value.seq) || 0;
         activeIncidents = new Map(Object.entries(row.value.incidents || {}));   // do not re-announce an outage after a restart
       }
+      if (row.key === 'cuts' && row.value && typeof row.value === 'object') cuts = new Map(Object.entries(row.value));
       if (row.key === 'trend' && Array.isArray(row.value)) {
         const cutoff = Date.now() - KEEP_BUCKETS * BUCKET_MS;
         buckets = row.value.filter(b => b && b.t > cutoff);
@@ -181,10 +238,10 @@ async function save() {
   if (!pool || !dirty) return;
   dirty = false;
   try {
-    await pool.query(`INSERT INTO monitor.kv (key, value, updated_at) VALUES ('events', $1, now()), ('trend', $2, now())
+    await pool.query(`INSERT INTO monitor.kv (key, value, updated_at) VALUES ('events', $1, now()), ('trend', $2, now()), ('cuts', $3, now())
       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
-      [JSON.stringify({ seq, events, incidents: Object.fromEntries(activeIncidents) }), JSON.stringify(buckets)]);
+      [JSON.stringify({ seq, events, incidents: Object.fromEntries(activeIncidents) }), JSON.stringify(buckets), JSON.stringify(Object.fromEntries(cuts))]);
   } catch (e) { dirty = true; console.error('[insights] save failed:', e.message); }
 }
 
-module.exports = { init, onAccounts, onIsps, napOutages, feedSince, trend, save };
+module.exports = { init, onAccounts, onIsps, napOutages, feedSince, trend, save, cutsView };
