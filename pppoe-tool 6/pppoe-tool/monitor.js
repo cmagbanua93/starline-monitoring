@@ -177,6 +177,7 @@ async function newBillingEnrichment() {
       contactNo:    String(c.phone || '').trim(),
       area:         String(c.area || '').trim(),
       napBox:       [c.nap, c.nap_port].map(v => String(v || '').trim()).filter(Boolean).join(' / '),
+      billingActive: c.billing_status ? c.billing_status === 'active' : null,
     });
   }
   return map;
@@ -730,7 +731,14 @@ async function billingFindRecord(username) {
 
   const row = hits[0];
   const get = n => (idx(n) === -1 ? '' : (row[idx(n)] || '').trim());
+  /* The account's Enabled / Disabled state. Read by header name when the export
+     has one, otherwise from its usual position — and only trusted when it really
+     says "enabled" or "disabled". */
+  let iState = ['STATUS', 'STATE', 'ACCOUNT STATUS', 'ACCSTATUS'].map(idx).find(i => i !== -1);
+  if (iState === undefined && header.length > 28) iState = 28;
+  const stateRaw = iState === undefined ? '' : String(row[iState] || '').trim().toLowerCase();
   return {
+    state: /^(enabled|disabled)$/.test(stateRaw) ? stateRaw : '',
     id: get('ID'), account: get('ACCOUNT'),
     fname: get('FNAME'), lname: get('LNAME'), area: get('AREA'),
     username: get('USERNAME'), password: get('PASSWORD'),
@@ -738,6 +746,33 @@ async function billingFindRecord(username) {
     dueDate: get('DUEDATE'), billDate: get('BILLDATE'),
     nap: get('NAP'), port: get('PORT'), phone: get('PHONE'),
   };
+}
+
+/* Every account number billing already uses — a new one must not clash. */
+async function billingAccountNumbers() {
+  const rows = parseCsv(await billingFetchCsv());
+  const i = rows.length ? rows[0].indexOf('ACCOUNT') : -1;
+  const set = new Set();
+  if (i !== -1) for (let r = 1; r < rows.length; r++) { const v = String(rows[r][i] || '').trim(); if (v) set.add(v); }
+  return set;
+}
+/* A new account number in the same style as the existing ones: ACCOUNT_NO_DIGITS
+   random digits (default 6, like 106142 / 917365), never one already in use. */
+const ACCOUNT_NO_AUTO = String(process.env.ACCOUNT_NO_AUTO || 'true').toLowerCase() !== 'false';
+const ACCOUNT_NO_DIGITS = Math.min(10, Math.max(4, parseInt(process.env.ACCOUNT_NO_DIGITS || '6', 10) || 6));
+function newAccountNumber(taken) {
+  const crypto = require('crypto');
+  const lo = 10 ** (ACCOUNT_NO_DIGITS - 1);
+  for (let i = 0; i < 500; i++) {
+    const n = String(crypto.randomInt(lo, lo * 10));
+    if (!taken.has(n)) return n;
+  }
+  throw new Error('could not find a free account number');
+}
+/* The account-number box on billing's edit form, whatever it is called there. */
+function accountFieldName(form) {
+  const names = Object.keys(form || {});
+  return names.find(n => /^(acc(oun)?t?[_-]?(no|num|number)?|accountno|account_no|acctno)$/i.test(n)) || null;
 }
 
 /* Due date = installation date + one calendar month. Overshoot is clamped to the
@@ -752,6 +787,30 @@ function addOneMonth(isoDate) {
   const lastDay = new Date(Date.UTC(targetY, targetM, 0)).getUTCDate();
   const day = Math.min(d, lastDay);
   return `${targetY}-${String(targetM).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+}
+
+/* Is this PPPoE account free to give to a new subscriber?
+     free      — no subscriber on it yet (spare / pre-created account)
+     in_use    — billing is active and the account is not disabled: a paying
+                 subscriber is on it. Never overwrite.
+     takeover  — it belonged to someone whose account is disabled or deactivated;
+                 it may be re-used (the old record is taken over by the new subscriber)
+     same      — the record already carries the new subscriber's own name (a re-push)
+   "Disabled" is read from the router (billing disables the secret when it cuts an
+   account) and, when the export has it, from billing's own state column. */
+const normName = v => String(v || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+function classifyRecord(record, username, forName) {
+  if (!record) return { state: 'free' };
+  const name = [record.fname, record.lname].filter(Boolean).join(' ').trim();
+  const placeholder = !normName(name) || normName(name) === normName(username);
+  const owner = { name: placeholder ? '' : name, account_no: record.account || '' };
+  if (!placeholder && forName && normName(forName) && normName(forName) === normName(name)) return { state: 'same', owner };
+  const live = (state.accounts || []).find(a => String(a.username || '').toLowerCase() === String(username || '').toLowerCase());
+  const disabled = (live && live.status === 'disabled') || record.state === 'disabled';
+  const active = billingIsActive(record);
+  if (active && !disabled) return { state: 'in_use', owner, online: live ? live.status === 'online' : null };
+  if (placeholder) return { state: 'free' };
+  return { state: 'takeover', owner, reason: disabled ? 'disabled' : 'deactivated' };
 }
 
 /* Billing counts as already switched on if TaokiNinam reports a billing type. */
@@ -858,6 +917,21 @@ async function billingPush(input) {
   const id = record.id;
   if (!id) throw new Error('billing record has no id — cannot address it');
 
+  /* Never write a new subscriber over an active, paying one (the sl151 case).
+     Allowed only when the account is free, already this subscriber's, or the old
+     subscriber's account is disabled or deactivated in billing. */
+  const cls = classifyRecord(record, input.username, [input.fname, input.lname].filter(Boolean).join(' '));
+  if (cls.state === 'in_use') {
+    const who = cls.owner.name ? `${cls.owner.name}${cls.owner.account_no ? ' (account ' + cls.owner.account_no + ')' : ''}` : `account ${cls.owner.account_no || id}`;
+    const e = new Error(`PPPoE ${input.username} already belongs to ${who}, whose billing is active — refusing to overwrite that subscriber. Link the PPPoE account actually programmed in the new modem, or disable / deactivate the old account in billing first.`);
+    e.code = 'IN_USE';
+    throw e;
+  }
+  if (cls.state === 'takeover') {
+    steps.push({ step: 'takeover', status: 'done',
+      detail: `took over the billing record of ${cls.owner.name || 'a former subscriber'}${cls.owner.account_no ? ' (account ' + cls.owner.account_no + ')' : ''}, whose account was ${cls.reason}` });
+  }
+
   const catalog = await billingCatalog();
   const area = String(input.area || '').trim();
   if (area && !catalog.areas.includes(area)) {
@@ -933,11 +1007,48 @@ async function billingPush(input) {
     steps.push({ step: 'billing', status: 'done', http: r2.status, dueDate, billdays: input.billdays == null ? 10 : input.billdays });
   }
 
+  /* ---- step 2b: an account number, if the record still has none ----
+     Done after billing is switched on, so a number billing hands out by itself
+     is kept. Otherwise a new unique one is written through the edit form and only
+     counted once it reads back from billing's own export. Never changes an
+     account number that already exists. */
+  let accountNo = String(after1.account || '').trim();
+  try {
+    const now = await billingFindRecord(input.username);
+    accountNo = String(now.account || '').trim();
+    if (accountNo) {
+      if (!String(record.account || '').trim()) steps.push({ step: 'account', status: 'done', detail: `billing gave it account number ${accountNo}` });
+    } else if (!ACCOUNT_NO_AUTO) {
+      steps.push({ step: 'account', status: 'skipped', detail: 'no account number yet — automatic numbering is switched off (ACCOUNT_NO_AUTO=false); set it in billing' });
+    } else {
+      const form = parseFormFields(await billingGet(`/editRecord.php?id=${encodeURIComponent(id)}`), 'editRecords');
+      const field = accountFieldName(form);
+      if (!form || !field) {
+        steps.push({ step: 'account', status: 'skipped', detail: 'billing\'s edit form has no account-number box this service can fill — set the account number in billing by hand' });
+      } else {
+        const candidate = newAccountNumber(await billingAccountNumbers());
+        const payloadA = Object.assign({}, form, { [field]: candidate, submit: form.submit || 'Submit' });
+        const rA = await billingPost(`/actions/editRecords.php?id=${encodeURIComponent(id)}`, payloadA);
+        const back = await billingFindRecord(input.username);
+        if (String(back.account || '').trim() === candidate) {
+          accountNo = candidate;
+          steps.push({ step: 'account', status: 'done', http: rA.status, detail: `account number ${candidate} assigned` });
+        } else {
+          accountNo = String(back.account || '').trim();
+          steps.push({ step: 'account', status: 'skipped', http: rA.status,
+            detail: accountNo ? `billing set its own account number ${accountNo}` : 'billing did not keep the account number sent from here — set it in billing by hand' });
+        }
+      }
+    }
+  } catch (e) {
+    steps.push({ step: 'account', status: 'skipped', detail: 'could not assign an account number: ' + e.message });
+  }
+
   /* ---- step 3: the plan (this is what triggers the welcome SMS) ---- */
   if (!product) {
     steps.push({ step: 'plan', status: 'skipped', detail: 'no plan on the ticket, so nothing to sync' });
     logPush({ username: input.username, id, ok: true, steps });
-    return { ok: true, recordId: id, steps };
+    return { ok: true, recordId: id, accountNo, steps };
   }
   /* Re-syncing a plan that is already correct is not free: TaokiNinam sends the
      welcome SMS on this step, so repeating it texts the subscriber again. A
@@ -948,7 +1059,7 @@ async function billingPush(input) {
     steps.push({ step: 'plan', status: 'skipped',
       detail: `already on ${product.name} / ${product.profile} — left alone so the welcome SMS is not sent twice` });
     logPush({ username: input.username, id, ok: true, steps });
-    return { ok: true, recordId: id, steps };
+    return { ok: true, recordId: id, accountNo, steps };
   }
 
   const detHtml = await billingGet(`/recordDetails.php?id=${encodeURIComponent(id)}`);
@@ -971,7 +1082,7 @@ async function billingPush(input) {
   }
   steps.push({ step: 'plan', status: 'done', http: r3.status, product: product.name, profile: product.profile });
   logPush({ username: input.username, id, ok: true, steps });
-  return { ok: true, recordId: id, steps };
+  return { ok: true, recordId: id, accountNo, steps };
 }
 
 /* The customer list changes a few times a day, not every 30 s. Downloading the
@@ -1008,6 +1119,7 @@ async function fetchBillingEnrichmentNow() {
     const iUsername = col('USERNAME');
     const iNap      = col('NAP');
     const iPort     = col('PORT');
+    const iBilling  = col('BILLING');
 
     if (iUsername === -1) throw new Error('billing export missing USERNAME column');
 
@@ -1028,6 +1140,7 @@ async function fetchBillingEnrichmentNow() {
         contactNo:    (row[iPhone] || '').trim(),
         area:         (row[iArea] || '').trim(),
         napBox:       [nap, port].filter(Boolean).join(' / '),
+        billingActive: iBilling === -1 ? null : billingIsActive({ billing: row[iBilling] }),
       });
     }
 
@@ -1122,6 +1235,7 @@ async function pollRouter() {
         contactNo: enrich.contactNo || '',
         area: enrich.area || '',
         napBox: enrich.napBox || '',
+        billingActive: enrich.billingActive == null ? null : enrich.billingActive,
       });
     }
 
@@ -2740,6 +2854,7 @@ function publicAccount(a) {
     napBox:       a.napBox || '',
     napName:      napNameOf(a.napBox),
     status:       a.status,
+    billingActive: a.billingActive == null ? null : a.billingActive,
     uptime:       a.uptime || '',
     lastSeen:     a.lastSeen || null,
     lastLogout:   a.lastLogout || null,
@@ -2956,10 +3071,10 @@ async function handleRequest(req, res) {
       const input = JSON.parse(body || '{}');
       if (!String(input.username || '').trim()) return send(400, { error: 'username (the PPPoE account) is required' });
       const out = await billingPush(input);
-      return send(out.ok ? 200 : 502, out);
+      return send(out.ok ? 200 : (out.code === 'IN_USE' ? 409 : 502), out);
     } catch (e) {
-      logPush({ username: (() => { try { return JSON.parse(body || '{}').username; } catch (_) { return ''; } })(), ok: false, error: e.message });
-      return send(502, { ok: false, error: e.message });
+      logPush({ username: (() => { try { return JSON.parse(body || '{}').username; } catch (_) { return ''; } })(), ok: false, error: e.message, code: e.code || '' });
+      return send(e.code === 'IN_USE' ? 409 : 502, { ok: false, error: e.message, code: e.code || undefined });
     }
   }
 
@@ -3040,7 +3155,24 @@ async function handleRequest(req, res) {
   if (path.startsWith('/api/billing-pppoe-status/')) {
     const send = (code, body) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(body)); };
     if (!API_TOKEN || !keyMatches(req.headers['x-api-key'] || '')) return send(401, { error: 'Not authorised' });
-    if (!USE_NEW_BILLING) return send(200, { state: 'unknown' });
+    if (!USE_NEW_BILLING) {
+      /* TaokiNinam: decide from its export plus the router. */
+      if (!BILLING_ENABLED) return send(200, { state: 'unknown' });
+      const u = decodeURIComponent(path.slice('/api/billing-pppoe-status/'.length));
+      const forName = new URL(req.url, 'http://x').searchParams.get('name') || '';
+      try {
+        let record = null;
+        try { record = await billingFindRecord(u); }
+        catch (e) {
+          if (/no billing record/.test(e.message)) record = null;
+          else if (/share the PPPoE username/.test(e.message)) return send(200, { state: 'in_use', owner: { name: 'more than one billing record' }, note: e.message });
+          else throw e;
+        }
+        return send(200, classifyRecord(record, u, forName));
+      } catch (e) {
+        return send(200, { state: 'unknown', error: describeFetchError(e) });
+      }
+    }
     try {
       const u = decodeURIComponent(path.slice('/api/billing-pppoe-status/'.length));
       const r = await newBillingFetch('/api/pppoe-status/' + encodeURIComponent(u), { passThrough: true });
