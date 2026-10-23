@@ -27,6 +27,17 @@ let activeIncidents = new Map();   // nap -> since (ISO) for "suspected" NAPs al
    "last logged out" time (billing ends the session when it disables the account). */
 let cuts = new Map();
 const KEEP_CUTS_MS = 8 * 24 * 3600e3;
+/* ISP latency history, for the per-link detail view:
+     ispRaw     every check of the last 6 h:   name -> [[t, ms | -1 when down], …]
+     ispHours   hourly roll-up for 30 days:     [{ t, isp: { name: [sum, count, down, min, max] } }]
+     ispOutages each time a link went down:     name -> [{ start, end | null }]  (30 days) */
+const RAW_KEEP_MS = 6 * 3600e3;
+const HOUR_MS = 3600e3;
+const KEEP_HOURS = 30 * 24;
+const KEEP_OUTAGE_MS = 30 * 24 * 3600e3;
+let ispRaw = {};
+let ispHours = [];
+let ispOutages = {};
 let pool = null;
 let dirty = false;
 
@@ -136,12 +147,92 @@ function onIsps(prev, next) {
     else if (was === false && i.online === true) addEvent('isp-up', `ISP link ${i.name} is back up`);
   }
   const b = currentBucket();
+  const h = currentHour();
+  const now = Date.now();
   for (const i of next) {
-    const s = b.isp[i.name] || (b.isp[i.name] = [0, 0, 0]);
-    if (i.online && i.latencyMs != null) { s[0] += Number(i.latencyMs); s[1] += 1; }
-    else if (i.online === false) s[2] += 1;
+    const up = i.online && i.latencyMs != null, ms = up ? Math.round(Number(i.latencyMs)) : null;
+    for (const s of [b.isp[i.name] || (b.isp[i.name] = [0, 0, 0]), h.isp[i.name] || (h.isp[i.name] = [0, 0, 0, null, null])]) {
+      if (up) {
+        s[0] += ms; s[1] += 1;
+        s[3] = s[3] == null ? ms : Math.min(s[3], ms);
+        s[4] = s[4] == null ? ms : Math.max(s[4], ms);
+      } else if (i.online === false) s[2] += 1;
+    }
+    if (i.online == null) continue;            // not checked yet
+    const raw = ispRaw[i.name] || (ispRaw[i.name] = []);
+    raw.push([now, up ? ms : -1]);
+    while (raw.length && raw[0][0] < now - RAW_KEEP_MS) raw.shift();
+    /* outage log */
+    const list = ispOutages[i.name] || (ispOutages[i.name] = []);
+    const open = list.length && !list[list.length - 1].end ? list[list.length - 1] : null;
+    if (i.online === false && !open) list.push({ start: new Date(now).toISOString(), end: null });
+    else if (i.online === true && open) open.end = new Date(now).toISOString();
+    while (list.length && list[0].end && new Date(list[0].end).getTime() < now - KEEP_OUTAGE_MS) list.shift();
   }
   dirty = true;
+}
+
+function currentHour() {
+  const t = Math.floor(Date.now() / HOUR_MS) * HOUR_MS;
+  let h = ispHours[ispHours.length - 1];
+  if (!h || h.t !== t) {
+    h = { t, isp: {} };
+    ispHours.push(h);
+    const cutoff = t - KEEP_HOURS * HOUR_MS;
+    ispHours = ispHours.filter(x => x.t > cutoff);
+  }
+  return h;
+}
+
+/* One ISP link in detail: points for the chosen range, summary figures and outages.
+   range: 1h | 6h (every check), 24h (5-minute averages), 7d | 30d (hourly averages). */
+function ispHistory(name, range) {
+  const spans = { '1h': HOUR_MS, '6h': 6 * HOUR_MS, '24h': 24 * HOUR_MS, '7d': 7 * 24 * HOUR_MS, '30d': 30 * 24 * HOUR_MS };
+  if (!spans[range]) range = '24h';
+  const t1 = Date.now(), t0 = t1 - spans[range];
+  let points = [], stepMs;
+  const raw = (ispRaw[name] || []).filter(r => r[0] >= t0);
+  /* just after an update there are few single checks yet: use the 5-minute averages until there are */
+  const rawOk = raw.length && raw[0][0] <= t0 + spans[range] * 0.5;
+  if ((range === '1h' || range === '6h') && rawOk) {
+    stepMs = null;
+    points = (ispRaw[name] || []).filter(r => r[0] >= t0).map(r => ({ t: r[0], avg: r[1] >= 0 ? r[1] : null, min: r[1] >= 0 ? r[1] : null, max: r[1] >= 0 ? r[1] : null, down: r[1] < 0 ? 1 : 0, n: 1 }));
+  } else {
+    const fine = range === '1h' || range === '6h' || range === '24h';
+    const src = fine ? buckets : ispHours;
+    stepMs = fine ? BUCKET_MS : HOUR_MS;
+    points = src.filter(b => b.t >= t0 - stepMs && b.isp && b.isp[name]).map(b => {
+      const v = b.isp[name], n = v[1] + v[2];
+      return { t: b.t, avg: v[1] ? Math.round(v[0] / v[1]) : null, min: v[3] != null ? v[3] : (v[1] ? Math.round(v[0] / v[1]) : null),
+        max: v[4] != null ? v[4] : (v[1] ? Math.round(v[0] / v[1]) : null), down: n ? v[2] / n : 0, n };
+    });
+  }
+  /* summary — from every check when we have them, otherwise weighted by checks */
+  let checks = 0, downChecks = 0, sum = 0, upChecks = 0, min = null, max = null;
+  const vals = [];
+  points.forEach(p => {
+    checks += p.n; downChecks += Math.round(p.down * p.n);
+    const up = p.n - Math.round(p.down * p.n);
+    if (p.avg != null && up > 0) {
+      sum += p.avg * up; upChecks += up; vals.push(p.avg);
+      min = min == null ? p.min : Math.min(min, p.min); max = max == null ? p.max : Math.max(max, p.max);
+    }
+  });
+  vals.sort((a, b) => a - b);
+  const p95 = vals.length ? vals[Math.min(vals.length - 1, Math.floor(vals.length * 0.95))] : null;
+  const outages = (ispOutages[name] || [])
+    .filter(o => !o.end || new Date(o.end).getTime() >= t0)
+    .map(o => ({ start: o.start, end: o.end, minutes: Math.max(1, Math.round(((o.end ? new Date(o.end).getTime() : t1) - new Date(o.start).getTime()) / 60000)) }))
+    .reverse();
+  const downMin = outages.reduce((a, o) => a + Math.round((Math.min(t1, o.end ? new Date(o.end).getTime() : t1) - Math.max(t0, new Date(o.start).getTime())) / 60000), 0);
+  /* how far back we actually have data for this range */
+  const since = points.length ? points[0].t : null;
+  return {
+    name, range, t0, t1, stepMs, since, points,
+    stats: { avg: upChecks ? Math.round(sum / upChecks) : null, min, max, p95, checks,
+      uptimePct: checks ? Math.round((1 - downChecks / checks) * 10000) / 100 : null, downMin: Math.max(0, downMin), outages: outages.length },
+    outages: outages.slice(0, 50),
+  };
 }
 
 function currentBucket() {
@@ -218,7 +309,7 @@ async function init(dbPool) {
   try {
     await pool.query(`CREATE SCHEMA IF NOT EXISTS monitor;
       CREATE TABLE IF NOT EXISTS monitor.kv (key text PRIMARY KEY, value jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now());`);
-    const r = await pool.query(`SELECT key, value FROM monitor.kv WHERE key IN ('events','trend','cuts')`);
+    const r = await pool.query(`SELECT key, value FROM monitor.kv WHERE key IN ('events','trend','cuts','isp')`);
     for (const row of r.rows) {
       if (row.key === 'events' && Array.isArray(row.value.events)) {
         events = row.value.events.slice(-KEEP_EVENTS); seq = Number(row.value.seq) || 0;
@@ -229,6 +320,30 @@ async function init(dbPool) {
         const cutoff = Date.now() - KEEP_BUCKETS * BUCKET_MS;
         buckets = row.value.filter(b => b && b.t > cutoff);
       }
+      if (row.key === 'isp' && row.value && typeof row.value === 'object') {
+        const v = row.value;
+        if (v.raw && typeof v.raw === 'object') {
+          const cut = Date.now() - RAW_KEEP_MS;
+          for (const [k, arr] of Object.entries(v.raw)) if (Array.isArray(arr)) ispRaw[k] = arr.filter(x => x[0] >= cut);
+        }
+        if (Array.isArray(v.hours)) { const cut = Date.now() - KEEP_HOURS * HOUR_MS; ispHours = v.hours.filter(h => h && h.t > cut); }
+        if (v.outages && typeof v.outages === 'object') ispOutages = v.outages;
+      }
+    }
+    /* first start with this version: build the hourly history from the 24 h we already have */
+    if (!ispHours.length && buckets.length) {
+      const byHour = new Map();
+      for (const b of buckets) {
+        const t = Math.floor(b.t / HOUR_MS) * HOUR_MS;
+        const h = byHour.get(t) || { t, isp: {} }; byHour.set(t, h);
+        for (const [k, v] of Object.entries(b.isp || {})) {
+          const s = h.isp[k] || (h.isp[k] = [0, 0, 0, null, null]);
+          s[0] += v[0]; s[1] += v[1]; s[2] += v[2];
+          if (v[1]) { const a = v[3] != null ? v[3] : v[0] / v[1], z = v[4] != null ? v[4] : v[0] / v[1];
+            s[3] = s[3] == null ? Math.round(a) : Math.min(s[3], Math.round(a)); s[4] = s[4] == null ? Math.round(z) : Math.max(s[4], Math.round(z)); }
+        }
+      }
+      ispHours = [...byHour.values()].sort((a, b) => a.t - b.t);
     }
     console.log(`[insights] restored ${events.length} events and ${buckets.length} trend points`);
   } catch (e) { console.error('[insights] could not restore history:', e.message); }
@@ -238,10 +353,11 @@ async function save() {
   if (!pool || !dirty) return;
   dirty = false;
   try {
-    await pool.query(`INSERT INTO monitor.kv (key, value, updated_at) VALUES ('events', $1, now()), ('trend', $2, now()), ('cuts', $3, now())
+    await pool.query(`INSERT INTO monitor.kv (key, value, updated_at) VALUES ('events', $1, now()), ('trend', $2, now()), ('cuts', $3, now()), ('isp', $4, now())
       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
-      [JSON.stringify({ seq, events, incidents: Object.fromEntries(activeIncidents) }), JSON.stringify(buckets), JSON.stringify(Object.fromEntries(cuts))]);
+      [JSON.stringify({ seq, events, incidents: Object.fromEntries(activeIncidents) }), JSON.stringify(buckets), JSON.stringify(Object.fromEntries(cuts)),
+       JSON.stringify({ raw: ispRaw, hours: ispHours, outages: ispOutages })]);
   } catch (e) { dirty = true; console.error('[insights] save failed:', e.message); }
 }
 
-module.exports = { init, onAccounts, onIsps, napOutages, feedSince, trend, save, cutsView };
+module.exports = { init, onAccounts, onIsps, napOutages, feedSince, trend, save, cutsView, ispHistory };

@@ -1700,6 +1700,49 @@ button.kpi { cursor:pointer; } button.kpi:hover { border-color: var(--accent); }
 .trend-tip .m { color: var(--dim); font-size: 11px; }
 .isp-spark { display:block; width:100%; height:28px; margin-top:2px; }
 
+/* ---- ISP detail pop-up ---- */
+.isp-card { cursor: pointer; transition: border-color .15s, transform .15s; }
+.isp-card:hover { border-color: #3b5579; transform: translateY(-1px); }
+.isp-card .isp-more { font-size: 10.5px; color: var(--dim); margin-top: -4px; }
+.ispm-back { position: fixed; inset: 0; background: rgba(2,6,12,.72); z-index: 900; display: flex; align-items: center; justify-content: center; padding: 20px; }
+.ispm-back[hidden] { display: none; }
+.ispm { background: var(--card); border: 1px solid var(--border); border-radius: 14px; width: min(1100px, 100%); max-height: 100%; overflow: auto; padding: 18px 20px 20px; box-shadow: 0 20px 60px rgba(0,0,0,.5); }
+.ispm-head { display: flex; align-items: flex-start; gap: 12px; }
+.ispm-head > div:first-child { flex: 1; min-width: 0; }
+.ispm-title { font-size: 18px; font-weight: 800; color: var(--text); }
+.ispm-sub { font-size: 12px; color: var(--dim); margin-top: 2px; }
+.ispm-now { text-align: right; flex: none; }
+.ispm-now .v { font-size: 26px; font-weight: 800; color: var(--isp-up); line-height: 1; }
+.ispm-now .v.down { color: var(--isp-down); }
+.ispm-now .l { font-size: 11px; color: var(--dim); }
+.ispm-x { background: none; border: 1px solid var(--border); color: var(--dim); border-radius: 8px; width: 34px; height: 34px; font-size: 18px; cursor: pointer; }
+.ispm-x:hover { color: var(--text); border-color: var(--dim); }
+.ispm-ranges { display: flex; gap: 6px; margin: 14px 0 10px; flex-wrap: wrap; }
+.ispm-ranges button { background: var(--card2); border: 1px solid var(--border); color: var(--dim); border-radius: 8px; padding: 6px 12px; font-size: 12.5px; font-weight: 700; cursor: pointer; }
+.ispm-ranges button.on { background: #d9b345; border-color: #d9b345; color: #12304a; }
+.ispm-stats { display: grid; grid-template-columns: repeat(6, 1fr); gap: 8px; margin-bottom: 12px; }
+.ispm-stat { background: var(--card2); border: 1px solid var(--border); border-radius: 10px; padding: 9px 11px; }
+.ispm-stat .n { font-size: 18px; font-weight: 800; color: var(--text); }
+.ispm-stat .l { font-size: 10.5px; color: var(--dim); text-transform: uppercase; letter-spacing: .04em; }
+.ispm-chart { position: relative; background: #0d1520; border: 1px solid var(--border); border-radius: 10px; padding: 6px 4px 0; }
+.ispm-chart svg { display: block; width: 100%; height: 300px; }
+.ispm-tip { position: absolute; pointer-events: none; background: #0b1220; border: 1px solid var(--border); border-radius: 8px; padding: 6px 9px; font-size: 12px; color: var(--text); white-space: nowrap; display: none; z-index: 2; }
+.ispm-tip .m { color: var(--dim); font-size: 11px; }
+.ispm-legend { display: flex; gap: 14px; font-size: 11.5px; color: var(--dim); margin: 8px 2px 0; flex-wrap: wrap; }
+.ispm-legend i { display: inline-block; width: 12px; height: 8px; border-radius: 2px; margin-right: 5px; vertical-align: middle; }
+.ispm-note { font-size: 11.5px; color: var(--dim); margin-top: 6px; }
+.ispm-out { margin-top: 14px; }
+.ispm-out h4 { margin: 0 0 6px; font-size: 13px; color: var(--text); }
+.ispm-out table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.ispm-out td { padding: 6px 8px; border-top: 1px solid var(--border); color: var(--text); }
+.ispm-out td.d { color: var(--dim); }
+@media (max-width: 760px) {
+  .ispm-back { padding: 0; }
+  .ispm { border-radius: 0; height: 100%; padding: 14px; }
+  .ispm-stats { grid-template-columns: repeat(3, 1fr); }
+  .ispm-chart svg { height: 230px; }
+}
+
 /* ---- compact overview ---- */
 .live-card { min-height: 0; padding: 20px; }
 .lc-header { margin-bottom: 14px; }
@@ -2127,7 +2170,7 @@ function renderIsps(isps) {
     const state = isp.online === null ? 'null' : (isp.online ? 'true' : 'false');
     const label = isp.online === null ? 'Checking…' : (isp.online ? 'Online' : 'Offline');
     const lat   = isp.online && isp.latencyMs != null ? Math.round(isp.latencyMs) + ' ms' : '—';
-    return \`<div class="isp-card" data-online="\${state}">
+    return \`<div class="isp-card" data-online="\${state}" data-isp="\${esc(isp.name)}" onclick="openIsp(this.dataset.isp)" title="Show latency history">
       <div class="isp-top">
         <span class="isp-status-dot"></span>
         <span class="isp-status-label">\${label}</span>
@@ -2137,9 +2180,11 @@ function renderIsps(isps) {
       <div class="isp-ip">\${esc(isp.ip)}</div>
       <div class="isp-latency">\${lat}</div>
       <svg class="isp-spark" data-isp="\${esc(isp.name)}" role="img" aria-label="Latency over the last 24 hours"></svg>
+      <div class="isp-more">Tap for history ›</div>
     </div>\`;
   }).join('');
   drawSparks();
+  if (typeof ISPM !== 'undefined' && ISPM.name) renderIspHead();
 }
 
 // ---- Donut chart ----
@@ -2827,7 +2872,198 @@ function applyDisplay() {
     </tr>\`;
   }).join('');
 }
+var POLL_SECONDS = ${Math.round(POLL_INTERVAL_MS / 1000)};
+
+// ---- ISP detail pop-up: bigger latency history for one link ----
+var ISPM = { name: null, range: '24h', data: null, timer: null };
+var ISPM_RANGES = [['1h', '1 hour'], ['6h', '6 hours'], ['24h', '24 hours'], ['7d', '7 days'], ['30d', '30 days']];
+function openIsp(name) {
+  ISPM.name = name; ISPM.data = null;
+  document.getElementById('ispm').hidden = false;
+  document.body.style.overflow = 'hidden';
+  try { history.replaceState(null, '', '#isp=' + encodeURIComponent(name)); } catch (e) {}
+  renderIspHead(); loadIsp();
+  clearInterval(ISPM.timer);
+  ISPM.timer = setInterval(function () { if (!document.hidden) loadIsp(); }, 30000);
+}
+function closeIsp() {
+  document.getElementById('ispm').hidden = true;
+  document.body.style.overflow = '';
+  clearInterval(ISPM.timer); ISPM.name = null;
+  try { if (location.hash.indexOf('#isp=') === 0) history.replaceState(null, '', location.pathname + location.search); } catch (e) {}
+}
+function setIspRange(r) { ISPM.range = r; ISPM.data = null; renderIspBody(); loadIsp(); }
+document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && ISPM.name) closeIsp(); });
+function loadIsp() {
+  var name = ISPM.name, range = ISPM.range;
+  if (!name) return;
+  fetch('/api/isp-history?name=' + encodeURIComponent(name) + '&range=' + range, { credentials: 'same-origin' })
+    .then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (d) { if (!d || name !== ISPM.name || range !== ISPM.range) return; ISPM.data = d; renderIspHead(); renderIspBody(); })
+    .catch(function () {});
+}
+function ispLive() { return (LAST_ISPS || []).filter(function (i) { return i.name === ISPM.name; })[0] || null; }
+function renderIspHead() {
+  if (!ISPM.name) return;
+  var i = ispLive() || {};
+  document.getElementById('ispm-title').textContent = ISPM.name;
+  document.getElementById('ispm-sub').textContent = (i.plan ? i.plan + ' · ' : '') + (i.ip || '') + ' · checked every ' + Math.round((window.POLL_SECONDS || 30)) + ' s';
+  var v = document.getElementById('ispm-now');
+  if (i.online === false) { v.textContent = 'DOWN'; v.className = 'v down'; }
+  else if (i.online && i.latencyMs != null) { v.textContent = Math.round(i.latencyMs) + ' ms'; v.className = 'v'; }
+  else { v.textContent = '—'; v.className = 'v'; }
+  document.getElementById('ispm-ranges').innerHTML = ISPM_RANGES.map(function (r) {
+    return '<button class="' + (ISPM.range === r[0] ? 'on' : '') + '" onclick="setIspRange(&quot;' + r[0] + '&quot;)">' + r[1] + '</button>';
+  }).join('');
+}
+function fmtDur(min) {
+  if (min == null) return '—';
+  if (min < 60) return min + ' min';
+  var h = Math.floor(min / 60), m = min % 60;
+  if (h < 48) return h + ' h' + (m ? ' ' + m + ' min' : '');
+  return Math.floor(h / 24) + ' d ' + (h % 24) + ' h';
+}
+function fmtWhen(t, range) {
+  var d = new Date(t);
+  if (range === '7d' || range === '30d') return d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: (range === '1h' || range === '6h') ? '2-digit' : undefined });
+}
+function renderIspBody() {
+  renderIspHead();
+  var d = ISPM.data, st = d && d.stats;
+  var tile = function (n, l) { return '<div class="ispm-stat"><div class="n">' + n + '</div><div class="l">' + l + '</div></div>'; };
+  var ms = function (v) { return v == null ? '—' : v + ' ms'; };
+  document.getElementById('ispm-stats').innerHTML = !d ? tile('…', 'Loading') :
+    tile(ms(st.avg), 'Average') + tile(ms(st.min), 'Lowest') + tile(ms(st.max), 'Highest') + tile(ms(st.p95), '95% under') +
+    tile(st.uptimePct == null ? '—' : st.uptimePct + '%', 'Uptime') + tile(st.downMin ? fmtDur(st.downMin) : 'none', 'Down time');
+  drawIspChart();
+  var note = '';
+  if (d) {
+    var span = { '1h': 3600e3, '6h': 6 * 3600e3, '24h': 24 * 3600e3, '7d': 7 * 24 * 3600e3, '30d': 30 * 24 * 3600e3 }[d.range];
+    if (!d.points.length) note = 'No history for this range yet — it builds up as the monitor runs.';
+    else if (d.since && d.since - d.t0 > span * 0.1) note = 'History starts ' + fmtWhen(d.since, '30d') + ' — the rest of this range fills in as the monitor runs.';
+    note += (note ? ' ' : '') + (!d.stepMs ? 'Every single check is shown.' : d.stepMs < 3600e3 ? 'Each point is a 5-minute average.' : 'Each point is a 1-hour average.');
+  }
+  document.getElementById('ispm-note').textContent = note;
+  var out = document.getElementById('ispm-out');
+  if (!d) { out.innerHTML = ''; return; }
+  out.innerHTML = '<h4>Outages in this period' + (d.outages.length ? ' (' + d.outages.length + ')' : '') + '</h4>' + (d.outages.length
+    ? '<table>' + d.outages.map(function (o) {
+        return '<tr><td>' + esc(new Date(o.start).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })) + '</td>' +
+          '<td class="d">' + (o.end ? 'back ' + esc(new Date(o.end).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })) : '<b style="color:var(--isp-down)">still down</b>') + '</td>' +
+          '<td>' + fmtDur(o.minutes) + '</td></tr>';
+      }).join('') + '</table>'
+    : '<div class="ispm-note">None — the link stayed up the whole time.</div>');
+}
+function drawIspChart() {
+  var svg = document.getElementById('ispm-svg'), tip = document.getElementById('ispm-tip');
+  svg.innerHTML = ''; tip.style.display = 'none';
+  var d = ISPM.data;
+  if (!d) return;
+  var W = svg.clientWidth || 900, H = svg.clientHeight || 300, L = 44, R = 10, T = 10, B = 24;
+  svg.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
+  var pts = d.points, t0 = d.t0, t1 = d.t1;
+  var ups = pts.filter(function (p) { return p.avg != null; });
+  /* scale on the typical latency so a few spikes don't flatten the chart;
+     anything above the top is clipped there (the tooltip still shows the real value) */
+  var avgs = ups.map(function (p) { return p.avg; }).sort(function (a, b) { return a - b; });
+  var maxAvg = avgs.length ? avgs[avgs.length - 1] : 10;
+  var p99 = avgs.length ? avgs[Math.floor((avgs.length - 1) * 0.99)] : 10;
+  var top = Math.max(10, p99 * 2.5, maxAvg * 1.1);
+  var step = [1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000, 2000].filter(function (s) { return top / s <= 5; })[0] || 1000;
+  top = Math.ceil(top / step) * step;
+  var x = function (t) { return L + (t - t0) / (t1 - t0) * (W - L - R); };
+  var y = function (v) { return T + (1 - Math.min(v, top) / top) * (H - T - B); };
+  for (var g = 0; g <= top; g += step) {
+    svg.appendChild(svgEl('line', { x1: L, x2: W - R, y1: y(g), y2: y(g), stroke: '#1e2b3c', 'stroke-width': 1 }));
+    var tl = svgEl('text', { x: L - 6, y: y(g) + 4, 'text-anchor': 'end', fill: '#8496ab', 'font-size': 11 }); tl.textContent = g + ' ms'; svg.appendChild(tl);
+  }
+  /* time labels */
+  var nT = Math.max(2, Math.min(8, Math.floor((W - L) / 110)));
+  for (var k = 0; k <= nT; k++) {
+    var tt = t0 + (t1 - t0) * k / nT;
+    var xl = svgEl('text', { x: x(tt), y: H - 6, 'text-anchor': k === 0 ? 'start' : k === nT ? 'end' : 'middle', fill: '#8496ab', 'font-size': 11 });
+    xl.textContent = (d.range === '7d' || d.range === '30d') ? new Date(tt).toLocaleDateString([], { month: 'short', day: 'numeric' }) : new Date(tt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    svg.appendChild(xl);
+  }
+  if (!pts.length) return;
+  var stepPx = d.stepMs ? Math.max(2, d.stepMs / (t1 - t0) * (W - L - R)) : Math.max(2, (W - L - R) / Math.max(pts.length, 1));
+  /* down periods */
+  pts.forEach(function (p) {
+    if (p.down > 0) svg.appendChild(svgEl('rect', { x: x(p.t) - (d.stepMs ? 0 : stepPx / 2), y: T, width: stepPx, height: H - T - B, fill: 'rgba(239,68,68,' + (0.15 + 0.35 * p.down).toFixed(2) + ')' }));
+  });
+  var gap = (d.stepMs || 30000) * 3.5;
+  var mid = function (p) { return d.stepMs ? p.t + d.stepMs / 2 : p.t; };
+  /* average line, broken where there is no data */
+  var segs = [], cur = [];
+  pts.forEach(function (p, i) {
+    if (p.avg == null || (cur.length && p.t - cur[cur.length - 1].t > gap)) { if (cur.length) segs.push(cur); cur = []; }
+    if (p.avg != null) cur.push(p);
+  });
+  if (cur.length) segs.push(cur);
+  segs.forEach(function (s) {
+    if (s.length > 1) {
+      var area = s.map(function (p, i) { return (i ? 'L' : 'M') + x(mid(p)).toFixed(1) + ',' + y(p.avg).toFixed(1); }).join(' ') +
+        ' L' + x(mid(s[s.length - 1])).toFixed(1) + ',' + y(0) + ' L' + x(mid(s[0])).toFixed(1) + ',' + y(0) + ' Z';
+      svg.appendChild(svgEl('path', { d: area, fill: 'rgba(56,189,248,.10)', stroke: 'none' }));
+    }
+    var line = s.map(function (p, i) { return (i ? 'L' : 'M') + x(mid(p)).toFixed(1) + ',' + y(p.avg).toFixed(1); }).join(' ');
+    if (s.length === 1) svg.appendChild(svgEl('circle', { cx: x(mid(s[0])), cy: y(s[0].avg), r: 2, fill: '#38bdf8' }));
+    else svg.appendChild(svgEl('path', { d: line, fill: 'none', stroke: '#38bdf8', 'stroke-width': 1.8, 'stroke-linejoin': 'round' }));
+  });
+  /* hover */
+  var cross = svgEl('line', { y1: T, y2: H - B, stroke: '#d9b345', 'stroke-width': 1, visibility: 'hidden' });
+  var dot = svgEl('circle', { r: 4, fill: '#d9b345', visibility: 'hidden' });
+  var hit = svgEl('rect', { x: L, y: T, width: W - L - R, height: H - T - B, fill: 'transparent' });
+  svg.appendChild(cross); svg.appendChild(dot); svg.appendChild(hit);
+  var box = document.getElementById('ispm-chart');
+  function move(ev) {
+    var r = svg.getBoundingClientRect(), px = (ev.clientX - r.left) * (W / r.width);
+    var t = t0 + (px - L) / (W - L - R) * (t1 - t0), best = null, bd = Infinity;
+    pts.forEach(function (p) { var dd = Math.abs(mid(p) - t); if (dd < bd) { bd = dd; best = p; } });
+    if (!best) return;
+    var cx = x(mid(best));
+    cross.setAttribute('x1', cx); cross.setAttribute('x2', cx); cross.setAttribute('visibility', 'visible');
+    if (best.avg != null) { dot.setAttribute('cx', cx); dot.setAttribute('cy', y(best.avg)); dot.setAttribute('visibility', 'visible'); } else dot.setAttribute('visibility', 'hidden');
+    var html = '<div class="m">' + esc(fmtWhen(best.t, d.range)) + (d.stepMs ? ' (' + (d.stepMs >= 3600e3 ? '1 h' : '5 min') + ')' : '') + '</div>';
+    if (best.avg != null) html += '<b>' + best.avg + ' ms</b>' + (d.stepMs && best.max !== best.min ? ' <span class="m">' + best.min + '–' + best.max + ' ms</span>' : '');
+    if (best.down > 0) html += '<div style="color:#f87171">' + (d.stepMs ? 'down ' + Math.round(best.down * 100) + '% of checks' : 'link DOWN') + '</div>';
+    tip.innerHTML = html; tip.style.display = 'block';
+    var left = cx / W * r.width + 12;
+    if (left + tip.offsetWidth > r.width - 4) left = cx / W * r.width - tip.offsetWidth - 12;
+    tip.style.left = Math.max(4, left) + 'px'; tip.style.top = '10px';
+  }
+  function leave() { cross.setAttribute('visibility', 'hidden'); dot.setAttribute('visibility', 'hidden'); tip.style.display = 'none'; }
+  hit.addEventListener('pointermove', move); hit.addEventListener('pointerdown', move); hit.addEventListener('pointerleave', leave);
+}
+window.addEventListener('resize', function () { if (ISPM.name) drawIspChart(); });
+/* a link like /#isp=PLDT%20500Mbps opens straight to that ISP (bookmark or share it) */
+function ispFromHash() {
+  if (location.hash.indexOf('#isp=') !== 0) return;
+  var n = ''; try { n = decodeURIComponent(location.hash.slice(5)); } catch (e) { return; }
+  if (n && n !== ISPM.name) openIsp(n);
+}
+window.addEventListener('hashchange', ispFromHash);
+setTimeout(ispFromHash, 600);
 </script>
+<div class="ispm-back" id="ispm" hidden onclick="if(event.target===this)closeIsp()">
+  <div class="ispm" role="dialog" aria-modal="true" aria-labelledby="ispm-title">
+    <div class="ispm-head">
+      <div><div class="ispm-title" id="ispm-title">ISP</div><div class="ispm-sub" id="ispm-sub"></div></div>
+      <div class="ispm-now"><div class="v" id="ispm-now">—</div><div class="l" id="ispm-nowl">latency now</div></div>
+      <button class="ispm-x" onclick="closeIsp()" aria-label="Close">×</button>
+    </div>
+    <div class="ispm-ranges" id="ispm-ranges"></div>
+    <div class="ispm-stats" id="ispm-stats"></div>
+    <div class="ispm-chart" id="ispm-chart"><svg id="ispm-svg"></svg><div class="ispm-tip" id="ispm-tip"></div></div>
+    <div class="ispm-legend">
+      <span><i style="background:#38bdf8"></i>Average latency</span>
+      <span><i style="background:rgba(239,68,68,.45)"></i>Link down</span>
+    </div>
+    <div class="ispm-note" id="ispm-note"></div>
+    <div class="ispm-out" id="ispm-out"></div>
+  </div>
+</div>
 </body>
 </html>`;
 }
@@ -3012,6 +3248,15 @@ async function handleRequest(req, res) {
   }
 
   /* events feed (incremental), 24 h trend, NAP outage groups — any signed-in user */
+  /* one ISP link's latency history for the detail pop-up — any signed-in user */
+  if (path === '/api/isp-history') {
+    const u = new URL(req.url, 'http://x');
+    const name = u.searchParams.get('name') || '';
+    if (!ISP_LINKS.some(i => i.name === name)) { res.writeHead(404, { 'Content-Type': 'application/json' }); return res.end('{"error":"Unknown ISP link"}'); }
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+    return res.end(JSON.stringify(insights.ispHistory(name, u.searchParams.get('range'))));
+  }
+
   if (path === '/api/feed' || path === '/api/trend' || path === '/api/nap-outages') {
     const u = new URL(req.url, 'http://x');
     const body = path === '/api/feed' ? insights.feedSince(u.searchParams.get('since'))
