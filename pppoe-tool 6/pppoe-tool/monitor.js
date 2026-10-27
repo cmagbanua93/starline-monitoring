@@ -1085,6 +1085,170 @@ async function billingPush(input) {
   return { ok: true, recordId: id, accountNo, steps };
 }
 
+/* ---------------- modem replacement on TaokiNinam ----------------
+ * A defective modem was replaced with one already programmed with another PPPoE
+ * account (e.g. the subscriber was on sl167, the new modem carries sl170).
+ * The subscriber keeps their own billing record (name, account number, balance,
+ * due date); only its PPPoE username and password change to the new modem's.
+ * If sl170 has its own billing record (a spare or a former subscriber's), that
+ * record is given the old account (sl167) in exchange, so no two records share a
+ * username. Every write is read back from billing's export before it counts. */
+const PPPOE_NAME_RE = /^[a-z0-9][a-z0-9._-]{0,39}$/i;
+
+/* Every record in the export, with the id to address it by. */
+async function billingRecordsAll() {
+  const rows = parseCsv(await billingFetchCsv());
+  if (!rows.length) throw new Error('billing export returned no rows');
+  const h = rows[0], idx = n => h.indexOf(n);
+  if (idx('USERNAME') === -1 || idx('ID') === -1) throw new Error('billing export has no USERNAME / ID column');
+  const get = (row, n) => (idx(n) === -1 ? '' : String(row[idx(n)] || '').trim());
+  const out = [];
+  for (let r = 1; r < rows.length; r++) {
+    const row = rows[r];
+    if (!get(row, 'ID')) continue;
+    out.push({ id: get(row, 'ID'), account: get(row, 'ACCOUNT'), fname: get(row, 'FNAME'), lname: get(row, 'LNAME'),
+      username: get(row, 'USERNAME'), password: get(row, 'PASSWORD'), billing: get(row, 'BILLING'),
+      products: get(row, 'PRODUCTS'), profile: get(row, 'PROFILE'),
+      state: (() => { let i = ['STATUS', 'STATE', 'ACCOUNT STATUS', 'ACCSTATUS'].map(idx).find(x => x !== -1);
+        if (i === undefined && h.length > 28) i = 28;
+        const v = i === undefined ? '' : String(row[i] || '').trim().toLowerCase();
+        return /^(enabled|disabled)$/.test(v) ? v : ''; })() });
+  }
+  return out;
+}
+
+/* The password the router holds for a PPPoE secret — what the modem is programmed with. */
+async function routerSecretPassword(name) {
+  if (!PPPOE_NAME_RE.test(name)) return '';
+  const out = await sshExec(`/ppp secret print terse where name="${name}"`);
+  const row = parseTerse(out).find(r => String(r.name || '').toLowerCase() === name.toLowerCase());
+  return row && row.password ? String(row.password) : '';
+}
+
+/* Writes a username + password onto one billing record and checks it landed.
+   Tries the record's edit form first; falls back to its service-settings form,
+   keeping the plan and profile exactly as the export shows them. */
+async function billingSetCredentials(rec, username, password) {
+  const landed = async () => {
+    const now = (await billingRecordsAll()).find(r => r.id === rec.id);
+    return now && now.username.toLowerCase() === username.toLowerCase() && (!now.password || !password || now.password === password);
+  };
+  const tried = [];
+  const editHtml = await billingGet(`/editRecord.php?id=${encodeURIComponent(rec.id)}`);
+  const form = parseFormFields(editHtml, 'editRecords');
+  if (form && 'username' in form) {
+    const p = Object.assign({}, form, { username, submit: form.submit || 'Submit' });
+    if ('password' in form) p.password = password;
+    const r = await billingPost(`/actions/editRecords.php?id=${encodeURIComponent(rec.id)}`, p);
+    if (await landed()) return { ok: true, via: 'edit form', http: r.status };
+    tried.push(`edit form (HTTP ${r.status})`);
+  }
+  const detHtml = await billingGet(`/recordDetails.php?id=${encodeURIComponent(rec.id)}`);
+  const svc = parseFormFields(detHtml, 'accountSettings');
+  if (svc && 'username' in svc) {
+    const p = Object.assign({}, svc, { username, password, submit: svc.submit || 'Submit' });
+    /* never let a default option change the plan */
+    if ('products' in svc) p.products = rec.products || '';
+    if ('profile_pppoe' in svc) p.profile_pppoe = rec.profile || '';
+    const r = await billingPost(`/actions/accountSettings.php?id=${encodeURIComponent(rec.id)}`, p);
+    if (await landed()) return { ok: true, via: 'service settings', http: r.status };
+    tried.push(`service settings (HTTP ${r.status})`);
+  }
+  return { ok: false, detail: tried.length ? `billing did not keep the new username — tried ${tried.join(', ')}` : 'billing has no form where the PPPoE username can be changed' };
+}
+
+async function billingModemSwapTaoki(input) {
+  const steps = [];
+  const oldUser = String(input.customer || '').trim().toLowerCase();
+  const newUser = String(input.newUsername || '').trim().toLowerCase();
+  const acct = String(input.account || '').trim();
+  if (!PPPOE_NAME_RE.test(newUser)) return { ok: false, steps, error: `"${input.newUsername}" is not a valid PPPoE username` };
+  if (oldUser && !PPPOE_NAME_RE.test(oldUser)) return { ok: false, steps, error: `"${input.customer}" is not a valid PPPoE username` };
+
+  let all = await billingRecordsAll();
+  const byUser = u => all.filter(r => r.username.toLowerCase() === u);
+  /* already done (a retry after a lost reply): the subscriber's record carries the new
+     account, and the old account is gone or sits on a record with no subscriber name */
+  {
+    const holder = byUser(newUser);
+    const named = r => !!normName([r.fname, r.lname].join(' ')) && normName([r.fname, r.lname].join(' ')) !== normName(r.username);
+    const oldOn = oldUser ? byUser(oldUser) : [];
+    const mine = holder.length === 1 && (acct ? holder[0].account === acct
+      : (oldOn.length === 1 && !named(oldOn[0]) && named(holder[0])));
+    if (mine) {
+      const h = holder[0];
+      steps.push({ step: 'subscriber', status: 'skipped', detail: `${[h.fname, h.lname].filter(Boolean).join(' ')}${h.account ? ' (account ' + h.account + ')' : ''} is already on ${newUser}` });
+      return { ok: true, recordId: h.id, steps };
+    }
+  }
+  /* the subscriber being repaired */
+  let subs = oldUser ? byUser(oldUser) : [];
+  if (!subs.length && acct) subs = all.filter(r => r.account === acct);
+  if (subs.length !== 1) {
+    if (byUser(newUser).length === 1 && oldUser && !byUser(oldUser).length) {
+      const done = byUser(newUser)[0];
+      steps.push({ step: 'subscriber', status: 'skipped', detail: `billing record ${done.account || done.id} already uses ${newUser}` });
+      return { ok: true, recordId: done.id, steps };
+    }
+    return { ok: false, steps, error: subs.length ? `${subs.length} billing records match ${oldUser || 'account ' + acct} — refusing to guess` : `no billing record found for ${oldUser || 'account ' + acct}` };
+  }
+  const sub = subs[0];
+  const subName = [sub.fname, sub.lname].filter(Boolean).join(' ') || sub.username;
+  if (sub.username.toLowerCase() === newUser) {
+    steps.push({ step: 'subscriber', status: 'skipped', detail: `${subName} is already on ${newUser}` });
+    return { ok: true, recordId: sub.id, steps };
+  }
+  const oldName = sub.username;
+
+  /* the record that holds the new modem's account today, if any */
+  const others = byUser(newUser).filter(r => r.id !== sub.id);
+  if (others.length > 1) return { ok: false, steps, error: `${others.length} billing records already use ${newUser} — fix that in billing first` };
+  const spare = others[0] || null;
+  if (spare) {
+    const cls = classifyRecord(spare, newUser, subName);
+    if (cls.state === 'in_use') {
+      const e = new Error(`${newUser} belongs to ${cls.owner.name || 'another subscriber'}${cls.owner.account_no ? ' (account ' + cls.owner.account_no + ')' : ''}, whose billing is active — refusing to take it`);
+      e.code = 'IN_USE'; throw e;
+    }
+  }
+
+  /* passwords: the router is the truth for what each modem is programmed with */
+  let newPass = '', oldPass = '';
+  try { newPass = await routerSecretPassword(newUser); } catch (e) { steps.push({ step: 'router', status: 'skipped', detail: 'could not read the router: ' + e.message }); }
+  if (!newPass && spare) newPass = spare.password;
+  if (!newPass) return { ok: false, steps, error: `no password found for ${newUser} — it is not on the router and has no billing record. Create the PPPoE secret first.` };
+  try { oldPass = await routerSecretPassword(oldName); } catch (e) {}
+  if (!oldPass) oldPass = sub.password;
+
+  /* subscriber first; if billing refuses a duplicate username, move the spare out of the way first */
+  let r1 = await billingSetCredentials(sub, newUser, newPass);
+  let spareDone = false;
+  if (!r1.ok && spare) {
+    /* billing will not let two records share a username: park the other record on a
+       temporary name, move the subscriber, then give the other record the old account */
+    const temp = `${newUser}-swap`.slice(0, 40);
+    const r0 = await billingSetCredentials(spare, temp, spare.password || newPass);
+    if (r0.ok) r1 = await billingSetCredentials(sub, newUser, newPass);
+    if (r0.ok && !r1.ok) await billingSetCredentials(spare, newUser, spare.password || newPass).catch(() => {});   // put it back
+  }
+  if (!r1.ok) {
+    steps.push({ step: 'subscriber', status: 'failed', detail: r1.detail });
+    return { ok: false, recordId: sub.id, steps, error: `could not change ${subName}'s PPPoE from ${oldName} to ${newUser}: ${r1.detail}` };
+  }
+  steps.push({ step: 'subscriber', status: 'done', http: r1.http,
+    detail: `${subName}${sub.account ? ' (account ' + sub.account + ')' : ''}: PPPoE ${oldName} → ${newUser}, password copied from ${newUser} (via ${r1.via})` });
+
+  if (spare && !spareDone) {
+    const r2 = await billingSetCredentials(spare, oldName, oldPass);
+    steps.push(r2.ok
+      ? { step: 'spare', status: 'done', detail: `record ${spare.account || spare.id} that held ${newUser} now holds ${oldName} (the defective modem's account)` }
+      : { step: 'spare', status: 'failed', detail: `${newUser} is now on two records — change the other one (${spare.account || 'id ' + spare.id}) in billing by hand. ${r2.detail}` });
+  }
+  enrichCache = null;               // dashboards pick up the new name on the next poll
+  const ok = steps.every(s => s.status !== 'failed');
+  return { ok, recordId: sub.id, steps, error: ok ? '' : 'the subscriber was moved, but the other record still needs fixing by hand' };
+}
+
 /* The customer list changes a few times a day, not every 30 s. Downloading the
    whole billing export on every poll was most of this service's network traffic,
    so it is fetched at most every BILLING_REFRESH_MINUTES (default 15) and reused
@@ -3374,12 +3538,12 @@ async function handleRequest(req, res) {
   }
 
   /* Repair with a re-used modem: the PPPoE account inside the replacement modem moves to the
-     subscriber being repaired (new billing only). Service key only. */
+     subscriber being repaired (new billing, or TaokiNinam: the record's PPPoE username + password). Service key only. */
   if (path === '/api/billing-modem-swap') {
     const send = (code, body) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(body)); };
     if (req.method !== 'POST') return send(405, { error: 'POST only' });
     if (!API_TOKEN || !keyMatches(req.headers['x-api-key'] || '')) return send(401, { error: 'Not authorised' });
-    if (!USE_NEW_BILLING) return send(503, { ok: false, error: 'Modem swaps are recorded automatically only after the cut-over to the new billing. For now, update the old billing by hand.' });
+    if (!USE_NEW_BILLING && !BILLING_ENABLED) return send(503, { ok: false, error: 'Billing is not configured on the monitor — update billing by hand.' });
     let body = '';
     try {
       await new Promise((resolve, reject) => {
@@ -3387,6 +3551,14 @@ async function handleRequest(req, res) {
         req.on('end', resolve); req.on('error', reject);
       });
       const input = JSON.parse(body || '{}');
+      if (!USE_NEW_BILLING) {
+        /* TaokiNinam: the subscriber's record takes the new modem's PPPoE username + password */
+        let out;
+        try { out = await billingModemSwapTaoki(input); }
+        catch (e) { out = { ok: false, steps: [], error: e.message, code: e.code }; }
+        logPush({ username: input.newUsername, swapFor: input.customer, ok: !!out.ok, steps: out.steps, error: out.error || '' });
+        return send(out.ok ? 200 : out.code === 'IN_USE' ? 409 : 502, out);
+      }
       const r = await newBillingFetch('/api/modem-swap', { method: 'POST', body: input, passThrough: true, timeout: 60000 });
       const out = Object.assign({ ok: false, steps: [] }, r.body || {});
       logPush({ username: input.newUsername, swapFor: input.customer, ok: !!out.ok, steps: out.steps, error: out.error || '' });
