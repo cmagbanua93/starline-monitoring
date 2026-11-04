@@ -969,6 +969,9 @@ async function billingPush(input) {
   payload.submit = current.submit || 'Submit';
 
   const r1 = await billingPost(`/actions/editRecords.php?id=${encodeURIComponent(id)}`, payload);
+  const detailsSent = {};
+  ['fname', 'lname', 'address', 'area', 'phone', 'coordinates', 'civil', 'citizenship', 'nap', 'nport', 'email']
+    .forEach(k => { if (k in payload && k in current) detailsSent[k] = payload[k]; });
   const after1 = await billingFindRecord(input.username);
   const landed = (want, got) => !want || String(got || '').trim().toLowerCase() === String(want).trim().toLowerCase();
   if (!landed(input.fname, after1.fname) || !landed(input.lname, after1.lname) || !landed(area, after1.area)) {
@@ -978,6 +981,29 @@ async function billingPush(input) {
     return { ok: false, recordId: id, steps };
   }
   steps.push({ step: 'details', status: 'done', http: r1.status });
+
+  /* Last check before reporting success: the Area must still be the box the
+     subscriber was installed on. A later step that re-saves billing's forms
+     must never leave it blank or changed; if one did, step 1 is written again. */
+  const keepArea = async () => {
+    if (!area) return;
+    try {
+      const now = await billingFindRecord(input.username);
+      if (String(now.area || '').trim().toLowerCase() === area.toLowerCase()) return;
+      const form = parseFormFields(await billingGet(`/editRecord.php?id=${encodeURIComponent(id)}`), 'editRecords');
+      if (!form) throw new Error('could not read the record form');
+      const accF = accountFieldName(form);
+      const fix = Object.assign({}, form, detailsSent, accF && now.account ? { [accF]: now.account } : {}, { submit: form.submit || 'Submit' });
+      await billingPost(`/actions/editRecords.php?id=${encodeURIComponent(id)}`, fix);
+      const back = await billingFindRecord(input.username);
+      if (String(back.area || '').trim().toLowerCase() === area.toLowerCase())
+        steps.push({ step: 'area', status: 'done', detail: `Area had been changed to "${now.area || 'blank'}" by a later step — set back to ${area}` });
+      else
+        steps.push({ step: 'area', status: 'failed', detail: `billing shows Area "${back.area || 'blank'}" instead of ${area} — set it in billing by hand` });
+    } catch (e) {
+      steps.push({ step: 'area', status: 'failed', detail: 'could not confirm the Area: ' + e.message });
+    }
+  };
 
   /* ---- step 2: billing ---- */
   if (billingIsActive(after1)) {
@@ -1027,7 +1053,10 @@ async function billingPush(input) {
         steps.push({ step: 'account', status: 'skipped', detail: 'billing\'s edit form has no account-number box this service can fill — set the account number in billing by hand' });
       } else {
         const candidate = newAccountNumber(await billingAccountNumbers());
-        const payloadA = Object.assign({}, form, { [field]: candidate, submit: form.submit || 'Submit' });
+        /* Re-posting the whole form must not undo step 1: billing's edit page may
+           pick the current Area with a script rather than a "selected" option, which
+           reads back as the first (blank) choice. Everything step 1 set goes back in. */
+        const payloadA = Object.assign({}, form, detailsSent, { [field]: candidate, submit: form.submit || 'Submit' });
         const rA = await billingPost(`/actions/editRecords.php?id=${encodeURIComponent(id)}`, payloadA);
         const back = await billingFindRecord(input.username);
         if (String(back.account || '').trim() === candidate) {
@@ -1047,8 +1076,10 @@ async function billingPush(input) {
   /* ---- step 3: the plan (this is what triggers the welcome SMS) ---- */
   if (!product) {
     steps.push({ step: 'plan', status: 'skipped', detail: 'no plan on the ticket, so nothing to sync' });
-    logPush({ username: input.username, id, ok: true, steps });
-    return { ok: true, recordId: id, accountNo, steps };
+    await keepArea();
+    const okN = !steps.some(x => x.status === 'failed');
+    logPush({ username: input.username, id, ok: okN, steps });
+    return { ok: okN, recordId: id, accountNo, steps };
   }
   /* Re-syncing a plan that is already correct is not free: TaokiNinam sends the
      welcome SMS on this step, so repeating it texts the subscriber again. A
@@ -1058,8 +1089,10 @@ async function billingPush(input) {
       String(already.profile  || '').trim().toLowerCase() === String(product.profile).toLowerCase()) {
     steps.push({ step: 'plan', status: 'skipped',
       detail: `already on ${product.name} / ${product.profile} — left alone so the welcome SMS is not sent twice` });
-    logPush({ username: input.username, id, ok: true, steps });
-    return { ok: true, recordId: id, accountNo, steps };
+    await keepArea();
+    const okS = !steps.some(x => x.status === 'failed');
+    logPush({ username: input.username, id, ok: okS, steps });
+    return { ok: okS, recordId: id, accountNo, steps };
   }
 
   const detHtml = await billingGet(`/recordDetails.php?id=${encodeURIComponent(id)}`);
@@ -1081,8 +1114,10 @@ async function billingPush(input) {
     return { ok: false, recordId: id, steps };
   }
   steps.push({ step: 'plan', status: 'done', http: r3.status, product: product.name, profile: product.profile });
-  logPush({ username: input.username, id, ok: true, steps });
-  return { ok: true, recordId: id, accountNo, steps };
+  await keepArea();
+  const okP = !steps.some(x => x.status === 'failed');
+  logPush({ username: input.username, id, ok: okP, steps });
+  return { ok: okP, recordId: id, accountNo, steps };
 }
 
 /* ---------------- modem replacement on TaokiNinam ----------------
@@ -1107,6 +1142,7 @@ async function billingRecordsAll() {
     const row = rows[r];
     if (!get(row, 'ID')) continue;
     out.push({ id: get(row, 'ID'), account: get(row, 'ACCOUNT'), fname: get(row, 'FNAME'), lname: get(row, 'LNAME'),
+      area: get(row, 'AREA'), nap: get(row, 'NAP'), port: get(row, 'PORT'),
       username: get(row, 'USERNAME'), password: get(row, 'PASSWORD'), billing: get(row, 'BILLING'),
       products: get(row, 'PRODUCTS'), profile: get(row, 'PROFILE'),
       state: (() => { let i = ['STATUS', 'STATE', 'ACCOUNT STATUS', 'ACCSTATUS'].map(idx).find(x => x !== -1);
@@ -1131,7 +1167,8 @@ async function routerSecretPassword(name) {
 async function billingSetCredentials(rec, username, password) {
   const landed = async () => {
     const now = (await billingRecordsAll()).find(r => r.id === rec.id);
-    return now && now.username.toLowerCase() === username.toLowerCase() && (!now.password || !password || now.password === password);
+    return now && now.username.toLowerCase() === username.toLowerCase() && (!now.password || !password || now.password === password)
+      && (!rec.area || now.area === rec.area);
   };
   const tried = [];
   const editHtml = await billingGet(`/editRecord.php?id=${encodeURIComponent(rec.id)}`);
@@ -1139,6 +1176,11 @@ async function billingSetCredentials(rec, username, password) {
   if (form && 'username' in form) {
     const p = Object.assign({}, form, { username, submit: form.submit || 'Submit' });
     if ('password' in form) p.password = password;
+    /* put back what the export says, so a script-selected Area is not lost on save */
+    const keepF = { area: rec.area, nap: rec.nap, nport: rec.port, fname: rec.fname, lname: rec.lname };
+    const accF = accountFieldName(form);
+    if (accF && rec.account) keepF[accF] = rec.account;
+    Object.entries(keepF).forEach(([k, v]) => { if (k in form && v) p[k] = v; });
     const r = await billingPost(`/actions/editRecords.php?id=${encodeURIComponent(rec.id)}`, p);
     if (await landed()) return { ok: true, via: 'edit form', http: r.status };
     tried.push(`edit form (HTTP ${r.status})`);
