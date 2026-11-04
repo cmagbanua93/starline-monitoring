@@ -197,6 +197,8 @@ let state = {
   pollError: null,
   routerHost: 'Main router',   // the router's real address stays on the server (it is not shown to anyone)
   pollIntervalSec: Math.round(POLL_INTERVAL_MS / 1000),
+  idlePollSec: 0,               // set by the scheduler
+  nextPollAt: null,
   alertThreshold: ALERT_THRESHOLD,
   billingEnabled: BILLING_ENABLED,
   billingLastSync: null,
@@ -1516,11 +1518,49 @@ function broadcast() {
     payload = `data: ${JSON.stringify(state)}\n\n`;
     lastFullKey = key; lastFullAt = Date.now();
   } else {
-    payload = `event: tick\ndata: ${JSON.stringify({ lastPoll: state.lastPoll, pollIntervalSec: state.pollIntervalSec })}\n\n`;
+    payload = `event: tick\ndata: ${JSON.stringify({ lastPoll: state.lastPoll, pollIntervalSec: state.pollIntervalSec, nextPollAt: state.nextPollAt })}\n\n`;
   }
   for (const client of sseClients) {
     try { client.write(payload); } catch {}
   }
+}
+
+/* ---------------- when to poll ----------------
+ * The router (SSH), the ISP links and — through the 15-minute cache — billing are
+ * only read as often as someone actually needs the answer:
+ *   • a dashboard is open:  every MONITOR_POLL_INTERVAL seconds (live)
+ *   • nobody is watching:   every MONITOR_IDLE_POLL_MINUTES (default 5), so the
+ *                           history, outage events and charts keep going;
+ *                           0 = no background polling at all
+ *   • someone opens the dashboard, presses Refresh, or ticketing / the map asks
+ *     for live data: polled right away if the last poll is older than that use
+ *     needs. Concurrent requests share one poll. */
+const IDLE_POLL_MS = Math.max(0, parseFloat(process.env.MONITOR_IDLE_POLL_MINUTES ?? '5') || 0) * 60 * 1000;
+const SERVICE_MAX_AGE_MS = Math.max(15, parseInt(process.env.MONITOR_SERVICE_MAX_AGE || '120', 10)) * 1000;
+let pollInFlight = null, pollTimer = null;
+const pollAgeMs = () => state.lastPoll ? Date.now() - new Date(state.lastPoll).getTime() : Infinity;
+const pollEveryMs = () => (sseClients.size ? POLL_INTERVAL_MS : IDLE_POLL_MS);
+function pollNow() {
+  if (!pollInFlight) {
+    clearTimeout(pollTimer); pollTimer = null;
+    pollInFlight = Promise.allSettled([pollRouter(), pollIsps()])
+      .finally(() => { pollInFlight = null; scheduleNextPoll(); });
+  }
+  return pollInFlight;
+}
+function scheduleNextPoll() {
+  clearTimeout(pollTimer); pollTimer = null;
+  if (pollInFlight) return;                       // rescheduled when it finishes
+  const every = pollEveryMs();
+  state.idlePollSec = Math.round(IDLE_POLL_MS / 1000);
+  if (!every) { state.nextPollAt = null; return; }
+  const wait = Math.max(1000, every - pollAgeMs());
+  state.nextPollAt = new Date(Date.now() + wait).toISOString();
+  pollTimer = setTimeout(pollNow, wait);
+}
+/* Make sure the data is no older than maxAgeMs, polling now if it is. */
+async function freshWithin(maxAgeMs) {
+  if (pollAgeMs() > maxAgeMs) await pollNow();
 }
 
 /* The router's address and port never reach a browser: replace them (and any
@@ -1642,6 +1682,9 @@ body { font-family: Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto
 .topbar h1 { font-size:13px; font-weight:700; color:#e6ebf2; display:flex; align-items:center; gap:8px; text-transform:uppercase; letter-spacing:.06em; }
 .topbar .meta { font-size:11.5px; color:var(--dim); display:flex; gap:16px; flex-wrap:wrap; }
 .topbar .meta span strong { color:var(--text); }
+.refresh-btn { background:#d9b345; color:#12304a; border:none; border-radius:7px; padding:6px 12px; font-size:12px; font-weight:800; cursor:pointer; white-space:nowrap; }
+.refresh-btn:disabled { opacity:.6; cursor:wait; }
+.refresh-btn:hover:not(:disabled) { filter:brightness(1.08); }
 
 /* ---- Scrollable content ---- */
 .content { flex:1; overflow-y:auto; padding:20px 24px 32px; display:flex; flex-direction:column; gap:20px; }
@@ -2064,11 +2107,11 @@ button.kpi { cursor:pointer; } button.kpi:hover { border-color: var(--accent); }
 
     <!-- Top bar -->
     <div class="topbar">
-      <h1>Live status</h1>
+      <h1>Live status <button class="refresh-btn" id="refresh-btn" onclick="refreshNow()" title="Get fresh data from the router and ISP links now">↻ Refresh now</button></h1>
       <div class="meta">
         <span>Last poll: <strong id="tb-poll">—</strong></span>
-        <span>Next: <strong id="tb-next">—</strong>s</span>
-        <span>Interval: <strong id="tb-interval">—</strong>s</span>
+        <span>Next: <strong id="tb-next">—</strong></span>
+        <span>Interval: <strong id="tb-interval">—</strong>s while open<span id="tb-idle"></span></span>
         <span>Alert at: <strong id="tb-thresh">—</strong>+ offline</span>
         <span>Billing: <strong id="tb-billing">—</strong></span>
         <span>Flap counts since: <strong id="tb-started">—</strong></span>
@@ -2330,21 +2373,61 @@ let wasAlert      = false;
 let cdTimer       = null;
 
 // ---- SSE ----
-const evtSource = new EventSource('/events');
-evtSource.onmessage = e => render(JSON.parse(e.data));
-/* between full updates the server only says "polled at …" */
-evtSource.addEventListener('tick', e => {
-  const t = JSON.parse(e.data);
-  document.getElementById('tb-poll').textContent = fmt(t.lastPoll);
+/* The live feed is what tells the server someone is watching (and so to poll the
+   router every interval). A tab left in the background closes it after 2 minutes;
+   coming back reopens it, which fetches fresh data straight away. */
+let evtSource = null, hideTimer = null;
+function startCountdown(nextPollAt, fallbackSec) {
   clearInterval(cdTimer);
-  let rem = t.pollIntervalSec || 30;
-  document.getElementById('tb-next').textContent = rem;
-  cdTimer = setInterval(() => { rem=Math.max(0,rem-1); document.getElementById('tb-next').textContent=rem; }, 1000);
+  const el = document.getElementById('tb-next');
+  const tick = () => {
+    const rem = nextPollAt ? Math.max(0, Math.round((new Date(nextPollAt).getTime() - Date.now()) / 1000)) : fallbackSec;
+    el.textContent = rem == null ? '—' : rem + 's';
+  };
+  tick(); cdTimer = setInterval(tick, 1000);
+}
+function connectLive() {
+  if (evtSource) return;
+  evtSource = new EventSource('/events');
+  evtSource.onmessage = e => { document.getElementById('error-bar').classList.remove('active'); render(JSON.parse(e.data)); };
+  /* between full updates the server only says "polled at …" */
+  evtSource.addEventListener('tick', e => {
+    const t = JSON.parse(e.data);
+    document.getElementById('tb-poll').textContent = fmt(t.lastPoll);
+    startCountdown(t.nextPollAt, t.pollIntervalSec || 30);
+  });
+  evtSource.onerror = () => {
+    document.getElementById('error-bar').textContent = 'Lost connection — is node monitor.js still running?';
+    document.getElementById('error-bar').classList.add('active');
+  };
+}
+function disconnectLive() {
+  if (!evtSource) return;
+  evtSource.close(); evtSource = null;
+  clearInterval(cdTimer);
+  document.getElementById('tb-next').textContent = 'paused (tab in background)';
+}
+document.addEventListener('visibilitychange', () => {
+  clearTimeout(hideTimer);
+  if (document.hidden) hideTimer = setTimeout(disconnectLive, 2 * 60 * 1000);
+  else connectLive();
 });
-evtSource.onerror   = () => {
-  document.getElementById('error-bar').textContent = 'Lost connection — is node monitor.js still running?';
-  document.getElementById('error-bar').classList.add('active');
-};
+connectLive();
+
+function refreshNow() {
+  const b = document.getElementById('refresh-btn');
+  b.disabled = true; b.textContent = '↻ Refreshing…';
+  fetch('/api/refresh', { method: 'POST', credentials: 'same-origin' })
+    .then(r => r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status)))
+    .then(d => {
+      b.textContent = d.pollError ? '⚠ Router not reached' : '✓ Updated';
+      if (typeof loadFeed === 'function') loadFeed();
+      if (typeof loadTrend === 'function') loadTrend();
+      if (typeof loadCuts === 'function') loadCuts();
+    })
+    .catch(() => { b.textContent = '⚠ Failed'; })
+    .finally(() => setTimeout(() => { b.disabled = false; b.textContent = '↻ Refresh now'; }, 2500));
+}
 
 // ---- Audio ----
 function getACtx()  { if (!alarmCtx) alarmCtx = new (window.AudioContext||window.webkitAudioContext)(); return alarmCtx; }
@@ -2480,10 +2563,8 @@ function render(data) {
     : (data.billingError ? '⚠ ' + data.billingError : (data.billingCustomerCount + ' accounts synced ' + fmt(data.billingLastSync)));
   document.getElementById('tb-started').textContent = fmt(data.monitorStartedAt);
 
-  clearInterval(cdTimer);
-  let rem = data.pollIntervalSec || 30;
-  document.getElementById('tb-next').textContent = rem;
-  cdTimer = setInterval(() => { rem=Math.max(0,rem-1); document.getElementById('tb-next').textContent=rem; }, 1000);
+  startCountdown(data.nextPollAt, data.pollIntervalSec || 30);
+  document.getElementById('tb-idle').textContent = data.idlePollSec ? ' · every ' + Math.round(data.idlePollSec / 60) + ' min when closed' : ' · paused when closed';
 
   allAccounts = data.accounts || [];
   LAST_ISPS = data.isps || [];
@@ -3198,7 +3279,7 @@ function drawIspChart() {
   pts.forEach(function (p) {
     if (p.down > 0) svg.appendChild(svgEl('rect', { x: x(p.t) - (d.stepMs ? 0 : stepPx / 2), y: T, width: stepPx, height: H - T - B, fill: 'rgba(239,68,68,' + (0.15 + 0.35 * p.down).toFixed(2) + ')' }));
   });
-  var gap = (d.stepMs || 30000) * 3.5;
+  var gap = d.stepMs ? d.stepMs * 3.5 : 12 * 60000;   // single checks are minutes apart while nobody is watching
   var mid = function (p) { return d.stepMs ? p.t + d.stepMs / 2 : p.t; };
   /* average line, broken where there is no data */
   var segs = [], cur = [];
@@ -3434,10 +3515,29 @@ async function handleRequest(req, res) {
       'Connection':    'keep-alive',
     });
     res.flushHeaders();
-    res.write(`data: ${JSON.stringify(state)}\n\n`);
     sseClients.add(res);
-    req.on('close', () => sseClients.delete(res));
+    /* someone is watching: switch to the live interval, and poll now if the data is stale */
+    if (pollAgeMs() > POLL_INTERVAL_MS) pollNow(); else scheduleNextPoll();
+    res.write(`data: ${JSON.stringify(state)}\n\n`);
+    req.on('close', () => { sseClients.delete(res); if (!sseClients.size) scheduleNextPoll(); });
     return;
+  }
+
+  /* "Refresh now" on the dashboard. Polls unless the data is under 10 s old. */
+  if (path === '/api/refresh') {
+    if (req.method !== 'POST') { res.writeHead(405); return res.end(); }
+    await freshWithin(10 * 1000);
+    lastFullAt = 0;                    // send everyone the full picture, uptimes included
+    broadcast();
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+    return res.end(JSON.stringify({ ok: true, lastPoll: state.lastPoll, pollError: state.pollError || null }));
+  }
+
+  /* ticketing / the FTTH map asking about live status: never answer from data
+     older than MONITOR_SERVICE_MAX_AGE seconds (default 120) */
+  if (who.service && req.method === 'GET' && (path.startsWith('/api/customers') || path === '/api/naps' ||
+      path.startsWith('/api/billing-pppoe-status/') || path === '/api/state' || path === '/api/isps')) {
+    await freshWithin(SERVICE_MAX_AGE_MS);
   }
 
   if (path === '/api/ftth-map') {
@@ -3777,8 +3877,5 @@ Offline time source:
     .catch(e => console.error('[auth] init failed:', e.message))
     .then(() => insights.init(monitorAuth.dbPool()))
     .catch(e => console.error('[insights] init failed:', e.message));
-  pollRouter();
-  setInterval(pollRouter, POLL_INTERVAL_MS);
-  pollIsps();
-  setInterval(pollIsps, POLL_INTERVAL_MS);
+  pollNow();                          // first look on start; then scheduleNextPoll() takes over
 });
