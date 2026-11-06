@@ -987,23 +987,34 @@ async function billingPush(input) {
   /* Last check before reporting success: the Area must still be the box the
      subscriber was installed on. A later step that re-saves billing's forms
      must never leave it blank or changed; if one did, step 1 is written again. */
+  /* Last check before reporting success: the Area must still be the box, and an
+     account number given in this push must still be there. TaokiNinam saves the
+     whole record from its edit page, and boxes it fills in by script read back
+     blank — so a later save can quietly undo an earlier one (first the Area was
+     lost, then the account number). Whatever went missing is written back once. */
+  let keptAccount = '';                       // set by step 2b when it assigns a number
   const keepArea = async () => {
-    if (!area) return;
+    const want = { area: area || '', account: keptAccount || '' };
+    if (!want.area && !want.account) return;
+    const sameArea = r => !want.area || String(r.area || '').trim().toLowerCase() === want.area.toLowerCase();
+    const sameAcct = r => !want.account || String(r.account || '').trim() === want.account;
     try {
       const now = await billingFindRecord(input.username);
-      if (String(now.area || '').trim().toLowerCase() === area.toLowerCase()) return;
+      if (sameArea(now) && sameAcct(now)) return;
       const form = parseFormFields(await billingGet(`/editRecord.php?id=${encodeURIComponent(id)}`), 'editRecords');
       if (!form) throw new Error('could not read the record form');
       const accF = accountFieldName(form);
-      const fix = Object.assign({}, form, detailsSent, accF && now.account ? { [accF]: now.account } : {}, { submit: form.submit || 'Submit' });
+      const acct = want.account || String(now.account || '').trim();
+      const fix = Object.assign({}, form, detailsSent, accF && acct ? { [accF]: acct } : {}, { submit: form.submit || 'Submit' });
       await billingPost(`/actions/editRecords.php?id=${encodeURIComponent(id)}`, fix);
       const back = await billingFindRecord(input.username);
-      if (String(back.area || '').trim().toLowerCase() === area.toLowerCase())
-        steps.push({ step: 'area', status: 'done', detail: `Area had been changed to "${now.area || 'blank'}" by a later step — set back to ${area}` });
+      const lost = [!sameArea(now) && `Area (was "${now.area || 'blank'}")`, !sameAcct(now) && `account number (was "${now.account || 'blank'}")`].filter(Boolean).join(' and ');
+      if (sameArea(back) && sameAcct(back))
+        steps.push({ step: 'restore', status: 'done', detail: `a later save in billing changed the ${lost} — put back${want.area ? ' Area ' + want.area : ''}${want.account ? ', account ' + want.account : ''}` });
       else
-        steps.push({ step: 'area', status: 'failed', detail: `billing shows Area "${back.area || 'blank'}" instead of ${area} — set it in billing by hand` });
+        steps.push({ step: 'restore', status: 'failed', detail: `billing still shows Area "${back.area || 'blank'}", account "${back.account || 'blank'}" — set ${!sameArea(back) ? 'the Area to ' + want.area : ''}${!sameArea(back) && !sameAcct(back) ? ' and ' : ''}${!sameAcct(back) ? 'account number ' + want.account : ''} in billing by hand` });
     } catch (e) {
-      steps.push({ step: 'area', status: 'failed', detail: 'could not confirm the Area: ' + e.message });
+      steps.push({ step: 'restore', status: 'failed', detail: 'could not confirm the Area / account number: ' + e.message });
     }
   };
 
@@ -1045,7 +1056,7 @@ async function billingPush(input) {
     const now = await billingFindRecord(input.username);
     accountNo = String(now.account || '').trim();
     if (accountNo) {
-      if (!String(record.account || '').trim()) steps.push({ step: 'account', status: 'done', detail: `billing gave it account number ${accountNo}` });
+      if (!String(record.account || '').trim()) { keptAccount = accountNo; steps.push({ step: 'account', status: 'done', detail: `billing gave it account number ${accountNo}` }); }
     } else if (!ACCOUNT_NO_AUTO) {
       steps.push({ step: 'account', status: 'skipped', detail: 'no account number yet — automatic numbering is switched off (ACCOUNT_NO_AUTO=false); set it in billing' });
     } else {
@@ -1060,10 +1071,19 @@ async function billingPush(input) {
            reads back as the first (blank) choice. Everything step 1 set goes back in. */
         const payloadA = Object.assign({}, form, detailsSent, { [field]: candidate, submit: form.submit || 'Submit' });
         const rA = await billingPost(`/actions/editRecords.php?id=${encodeURIComponent(id)}`, payloadA);
-        const back = await billingFindRecord(input.username);
+        let back = await billingFindRecord(input.username);
+        let via = '';
+        if (String(back.account || '').trim() !== candidate && !String(back.account || '').trim()) {
+          /* Not kept: try the form exactly as billing renders it plus the number
+             (how it was done before 4 Nov, which billing did accept). The final
+             check then puts the Area back if that save loses it. */
+          await billingPost(`/actions/editRecords.php?id=${encodeURIComponent(id)}`, Object.assign({}, form, { [field]: candidate, submit: form.submit || 'Submit' }));
+          back = await billingFindRecord(input.username);
+          via = ' (second try)';
+        }
         if (String(back.account || '').trim() === candidate) {
-          accountNo = candidate;
-          steps.push({ step: 'account', status: 'done', http: rA.status, detail: `account number ${candidate} assigned` });
+          accountNo = candidate; keptAccount = candidate;
+          steps.push({ step: 'account', status: 'done', http: rA.status, detail: `account number ${candidate} assigned${via}` });
         } else {
           accountNo = String(back.account || '').trim();
           steps.push({ step: 'account', status: 'skipped', http: rA.status,
@@ -1144,7 +1164,7 @@ async function billingRecordsAll() {
     const row = rows[r];
     if (!get(row, 'ID')) continue;
     out.push({ id: get(row, 'ID'), account: get(row, 'ACCOUNT'), fname: get(row, 'FNAME'), lname: get(row, 'LNAME'),
-      area: get(row, 'AREA'), nap: get(row, 'NAP'), port: get(row, 'PORT'),
+      area: get(row, 'AREA'), nap: get(row, 'NAP'), port: get(row, 'PORT'), phone: get(row, 'PHONE'),
       username: get(row, 'USERNAME'), password: get(row, 'PASSWORD'), billing: get(row, 'BILLING'),
       products: get(row, 'PRODUCTS'), profile: get(row, 'PROFILE'),
       state: (() => { let i = ['STATUS', 'STATE', 'ACCOUNT STATUS', 'ACCSTATUS'].map(idx).find(x => x !== -1);
@@ -3465,6 +3485,23 @@ async function ftthMapView() {
 // Per-person accounts (admin / technician) live in monitor-auth.js.
 const monitorAuth = require('./monitor-auth');
 
+/* one-time clean-ups on TaokiNinam: missing account numbers, lost Area / NAP (billing-tools.js) */
+const billingTools = require('./billing-tools')({
+  billingRecordsAll, billingGet, billingPost, parseFormFields, accountFieldName, newAccountNumber,
+  billingCatalog, billingAddArea, digits: ACCOUNT_NO_DIGITS,
+  liveStatus: (u) => { const a = (state.accounts || []).find(x => String(x.username || '').toLowerCase() === String(u || '').toLowerCase()); return a ? a.status : ''; },
+  invalidate: () => { enrichCache = null; },
+  log: (m) => console.log(m),
+});
+function readJson(req, limit = 256 * 1024) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.on('data', c => { body += c; if (body.length > limit) { req.destroy(); reject(new Error('payload too large')); } });
+    req.on('end', () => { try { resolve(JSON.parse(body || '{}')); } catch (e) { reject(new Error('bad JSON')); } });
+    req.on('error', reject);
+  });
+}
+
 /* Who is asking: the ticketing/billing/map services with the shared key, or a
    signed-in person. Fails closed. */
 async function whoIs(req) {
@@ -3538,6 +3575,33 @@ async function handleRequest(req, res) {
   if (who.service && req.method === 'GET' && (path.startsWith('/api/customers') || path === '/api/naps' ||
       path.startsWith('/api/billing-pppoe-status/') || path === '/api/state' || path === '/api/isps')) {
     await freshWithin(SERVICE_MAX_AGE_MS);
+  }
+
+  /* ---- billing clean-up tools (admin, or the ticketing service) ---- */
+  if (path === '/tools/account-numbers' || path === '/api/billing-missing-accounts' || path === '/api/billing-records' || path === '/api/billing-batch') {
+    const send = (code, body) => { res.writeHead(code, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(body)); };
+    if (who.role !== 'admin') return send(403, { error: 'Administrator only.' });
+    if (USE_NEW_BILLING || !OLD_BILLING_ENABLED) return send(503, { error: 'These tools work on TaokiNinam only, and it is not configured here.' });
+    try {
+      if (path === '/tools/account-numbers') {
+        if (who.service) return send(400, { error: 'open this page in a browser' });
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+        return res.end(monitorAuth.shell(who, 'Account numbers', billingTools.page()));
+      }
+      if (path === '/api/billing-missing-accounts') return send(200, { records: await billingTools.missingAccounts() });
+      if (path === '/api/billing-records' && req.method === 'POST') {
+        const b = await readJson(req);
+        return send(200, { records: await billingTools.recordsFor(Array.isArray(b.usernames) ? b.usernames.slice(0, 2000) : []) });
+      }
+      if (path === '/api/billing-batch' && req.method === 'POST') {
+        const b = await readJson(req);
+        return send(200, billingTools.start(b.kind, Array.isArray(b.items) ? b.items.slice(0, 2000) : [], who.service ? 'ticketing' : (who.name || who.username || 'admin')));
+      }
+      if (path === '/api/billing-batch') return send(200, billingTools.status());
+      return send(405, { error: 'method not allowed' });
+    } catch (e) {
+      return send(e.code && e.code >= 400 && e.code < 600 ? e.code : 502, { error: describeFetchError ? describeFetchError(e) : e.message });
+    }
   }
 
   if (path === '/api/ftth-map') {

@@ -450,8 +450,9 @@ function userBarHtml(user) {
   const name = esc(user.name || user.username);
   return `<span class="who">${name} <span class="chip ${user.role}">${ROLE_LABEL[user.role] || user.role}</span></span>
     ${user.role === 'admin' && accountsOn() ? '<a class="hb" href="/users">Users</a>' : ''}
+    ${user.role === 'admin' ? '<a class="hb" href="/tools/account-numbers">Account numbers</a>' : ''}
     ${accountsOn() ? '<a class="hb" href="/account/password">Password</a>' : ''}
     <a class="hb" href="/logout">Sign out</a>`;
 }
 
-module.exports = { init, handle, currentUser, loginPage, userBarHtml, accountsOn, dbPool: () => (ready ? pool : null) };
+module.exports = { init, handle, currentUser, loginPage, userBarHtml, accountsOn, shell, dbPool: () => (ready ? pool : null) };
