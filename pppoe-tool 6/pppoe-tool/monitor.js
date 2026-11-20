@@ -1183,10 +1183,70 @@ async function routerSecretPassword(name) {
   return row && row.password ? String(row.password) : '';
 }
 
+/* ---- keeping the old PPPoE account's name on the router during a modem swap ----
+   When TaokiNinam saves a new username on an active record, it renames that record's
+   old secret on the MikroTik to a random string (sl155 → 3181d94e1e, sl152 →
+   986d69931f). The old account is the one still programmed in the pulled-out modem,
+   so it must keep its name to be reused. We note each secret's internal id before
+   TaokiNinam is touched and put the names back afterwards. */
+const rosStr = v => '"' + String(v == null ? '' : v).replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\$/g, '\\$') + '"';
+async function routerSecretIds() {
+  const [out] = await sshExecMany([':foreach i in=[/ppp secret find] do={:put ("$i|" . [/ppp secret get $i name])}']);
+  const byId = new Map(), byName = new Map();
+  String(out || '').split('\n').forEach(line => {
+    const m = line.trim().match(/^(\*[0-9A-Fa-f]+)\|(.*)$/);
+    if (m) { byId.set(m[1], m[2]); byName.set(m[2].toLowerCase(), m[1]); }
+  });
+  return { byId, byName };
+}
+async function routerSecretSnapshot(name) {
+  if (!PPPOE_NAME_RE.test(name || '')) return null;
+  const ids = await routerSecretIds();
+  const id = ids.byName.get(name.toLowerCase());
+  if (!id) return null;
+  const row = parseTerse(await sshExec(`/ppp secret print terse where name="${name}"`)).find(r => String(r.name || '').toLowerCase() === name.toLowerCase()) || {};
+  return { id, name, password: row.password || '', profile: row.profile || '', service: row.service || 'pppoe' };
+}
+/* Puts the secrets back under their own names. `spare` (the old account) is also
+   switched off and labelled as a spare; `keep` (the new modem's account) is only
+   renamed back if something renamed it. Safe to run again. */
+async function routerKeepNames({ spare, keep, label }) {
+  const steps = [];
+  if (!spare && !keep) return steps;
+  const ids = await routerSecretIds();
+  const cmds = [];
+  const note = String(label || '').replace(/[^A-Za-z0-9 ._\/:-]/g, '').slice(0, 120);
+  for (const [snap, isSpare] of [[spare, true], [keep, false]]) {
+    if (!snap) continue;
+    const cur = ids.byId.get(snap.id);
+    const holder = ids.byName.get(snap.name.toLowerCase());
+    if (cur === undefined) {
+      if (holder) continue;                                   // gone, but the name exists again
+      if (!isSpare) { steps.push({ step: 'router-name', status: 'failed', detail: `${snap.name} is no longer on the MikroTik — check it in Winbox` }); continue; }
+      cmds.push(`/ppp secret add name=${rosStr(snap.name)} password=${rosStr(snap.password)} service=${rosStr(snap.service)}${snap.profile ? ' profile=' + rosStr(snap.profile) : ''} disabled=yes comment=${rosStr(note)}`);
+      steps.push({ step: 'router-name', status: 'done', detail: `${snap.name} had been removed from the MikroTik — added back (disabled, spare)` });
+      continue;
+    }
+    if (cur.toLowerCase() !== snap.name.toLowerCase()) {
+      if (holder && holder !== snap.id) {
+        steps.push({ step: 'router-name', status: 'failed', detail: `the MikroTik secret ${cur} was ${snap.name}, but another secret already has that name — fix it in Winbox` });
+        continue;
+      }
+      cmds.push(`/ppp secret set ${snap.id} name=${rosStr(snap.name)}`);
+      steps.push({ step: 'router-name', status: 'done', detail: `billing had renamed ${snap.name} on the MikroTik to ${cur} — name put back to ${snap.name}` });
+    }
+    if (isSpare) cmds.push(`/ppp secret set ${snap.id} disabled=yes comment=${rosStr(note)}`);
+  }
+  if (cmds.length) await sshExecMany(cmds);
+  if (spare && !steps.some(x => x.status === 'failed' && x.detail.includes(spare.name)))
+    steps.push({ step: 'old-account', status: 'done', detail: `${spare.name} stays on the MikroTik under its own name, disabled, as a spare (no subscriber)` });
+  return steps;
+}
+
 /* Writes a username + password onto one billing record and checks it landed.
    Tries the record's edit form first; falls back to its service-settings form,
    keeping the plan and profile exactly as the export shows them. */
-async function billingSetCredentials(rec, username, password) {
+async function billingSetCredentials(rec, username, password, opts = {}) {
   const landed = async () => {
     const now = (await billingRecordsAll()).find(r => r.id === rec.id);
     return now && now.username.toLowerCase() === username.toLowerCase() && (!now.password || !password || now.password === password)
@@ -1200,6 +1260,8 @@ async function billingSetCredentials(rec, username, password) {
     if ('password' in form) p.password = password;
     /* put back what the export says, so a script-selected Area is not lost on save */
     const keepF = { area: rec.area, nap: rec.nap, nport: rec.port, fname: rec.fname, lname: rec.lname };
+    /* a spare keeps the placeholder look (name = its PPPoE), so nothing takes it for a subscriber */
+    if (opts.spareName) { keepF.fname = opts.spareName; keepF.lname = ''; if ('lname' in form) p.lname = ''; }
     const accF = accountFieldName(form);
     if (accF && rec.account) keepF[accF] = rec.account;
     Object.entries(keepF).forEach(([k, v]) => { if (k in form && v) p[k] = v; });
@@ -1284,6 +1346,12 @@ async function billingModemSwapTaoki(input) {
   try { oldPass = await routerSecretPassword(oldName); } catch (e) {}
   if (!oldPass) oldPass = sub.password;
 
+  /* note which MikroTik secrets these are before TaokiNinam can rename them */
+  let snapOld = null, snapNew = null;
+  try { snapOld = await routerSecretSnapshot(oldName); snapNew = await routerSecretSnapshot(newUser); }
+  catch (e) { steps.push({ step: 'router', status: 'skipped', detail: 'could not read the MikroTik secrets before the change: ' + e.message }); }
+  const spareLabel = `spare - was ${sub.account || ''} ${subName}, replaced by ${newUser} ${new Date(Date.now() + 8 * 3600000).toISOString().slice(0, 10)}`.replace(/\s+/g, ' ');
+
   /* subscriber first; if billing refuses a duplicate username, move the spare out of the way first */
   let r1 = await billingSetCredentials(sub, newUser, newPass);
   let spareDone = false;
@@ -1303,14 +1371,31 @@ async function billingModemSwapTaoki(input) {
     detail: `${subName}${sub.account ? ' (account ' + sub.account + ')' : ''}: PPPoE ${oldName} → ${newUser}, password copied from ${newUser} (via ${r1.via})` });
 
   if (spare && !spareDone) {
-    const r2 = await billingSetCredentials(spare, oldName, oldPass);
+    /* only a placeholder (never a named former subscriber) is relabelled as the spare */
+    const placeholder = !normName([spare.fname, spare.lname].join(' ')) || normName([spare.fname, spare.lname].join(' ')) === normName(newUser);
+    const r2 = await billingSetCredentials(spare, oldName, oldPass, placeholder ? { spareName: oldName } : {});
     steps.push(r2.ok
       ? { step: 'spare', status: 'done', detail: `record ${spare.account || spare.id} that held ${newUser} now holds ${oldName} (the defective modem's account)` }
       : { step: 'spare', status: 'failed', detail: `${newUser} is now on two records — change the other one (${spare.account || 'id ' + spare.id}) in billing by hand. ${r2.detail}` });
   }
+  /* the old account keeps its name on the MikroTik (TaokiNinam renames it) */
+  if (snapOld || snapNew) {
+    try { (await routerKeepNames({ spare: snapOld, keep: snapNew, label: spareLabel })).forEach(x => steps.push(x)); }
+    catch (e) { steps.push({ step: 'router-name', status: 'failed', detail: `could not check the MikroTik names: ${e.message} — in Winbox, make sure ${oldName} still exists under that name` }); }
+    /* TaokiNinam may also change the router a little later: look again a few times */
+    [45, 180, 900].forEach(sec => setTimeout(async () => {
+      try {
+        const late = (await routerKeepNames({ spare: snapOld, keep: snapNew, label: spareLabel })).filter(x => x.step === 'router-name');
+        if (late.length) logPush({ username: newUser, swapFor: oldName, ok: late.every(x => x.status !== 'failed'), steps: late, error: '', note: `router names re-checked after ${sec} s` });
+      } catch (e) { /* the next check tries again */ }
+    }, sec * 1000).unref());
+  } else if (oldName) {
+    steps.push({ step: 'router-name', status: 'skipped', detail: `${oldName} was not found on the MikroTik before the change` });
+  }
+
   enrichCache = null;               // dashboards pick up the new name on the next poll
   const ok = steps.every(s => s.status !== 'failed');
-  return { ok, recordId: sub.id, steps, error: ok ? '' : 'the subscriber was moved, but the other record still needs fixing by hand' };
+  return { ok, recordId: sub.id, steps, error: ok ? '' : 'the subscriber was moved, but something still needs fixing by hand (see the steps)' };
 }
 
 /* The customer list changes a few times a day, not every 30 s. Downloading the
