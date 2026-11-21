@@ -3541,6 +3541,27 @@ async function ftthNetwork() {
   return net;
 }
 
+/* Modem swap on a repair: move the subscriber's pin on the FTTH map to the new
+   modem's PPPoE account, the same change billing just made. Returns one step. */
+async function ftthPppoeSwap(input) {
+  const from = String(input.customer || '').trim(), to = String(input.newUsername || '').trim();
+  if (!FTTH_URL || !FTTH_TOKEN) return { step: 'map', status: 'skipped', detail: `the FTTH map is not linked to the monitor — change ${from} → ${to} on the map by hand` };
+  try {
+    const r = await fetch(FTTH_URL + '/api/pppoe-swap', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': FTTH_TOKEN },
+      body: JSON.stringify({ from, to, ticketId: input.ticketId || input.ticket || '', account: input.account || '' }),
+      signal: AbortSignal.timeout(20000),
+    });
+    const out = await r.json().catch(() => ({}));
+    if (!r.ok || !out.ok) return { step: 'map', status: 'failed', detail: `map not updated: ${out.error || 'HTTP ' + r.status} — change ${from} → ${to} on the subscriber's pin by hand` };
+    ftthCache = { at: 0, net: null };
+    return { step: 'map', status: out.status === 'done' ? 'done' : 'skipped', detail: out.detail };
+  } catch (e) {
+    return { step: 'map', status: 'failed', detail: `could not reach the FTTH map (${e.name === 'TimeoutError' ? 'no answer in time' : e.message}) — retry, or change ${from} → ${to} on the map by hand` };
+  }
+}
+
 async function ftthMapView() {
   const net = await ftthNetwork();
   const r6 = (n) => Math.round(Number(n) * 1e6) / 1e6;
@@ -3830,6 +3851,15 @@ async function handleRequest(req, res) {
 
   /* Repair with a re-used modem: the PPPoE account inside the replacement modem moves to the
      subscriber being repaired (new billing, or TaokiNinam: the record's PPPoE username + password). Service key only. */
+  /* Billing went through (or was already done on a retry) → the map follows.
+     A map failure keeps the job's Billing panel red so it gets retried; both sides are retry-safe. */
+  async function withMapStep(out, input) {
+    if (!out.ok || !out.steps) return;
+    const st = await ftthPppoeSwap(input);
+    out.steps.push(st);
+    if (st.status === 'failed') { out.ok = false; out.error = 'billing was updated, but the FTTH map was not (see the map step)'; }
+  }
+
   if (path === '/api/billing-modem-swap') {
     const send = (code, body) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(body)); };
     if (req.method !== 'POST') return send(405, { error: 'POST only' });
@@ -3847,11 +3877,13 @@ async function handleRequest(req, res) {
         let out;
         try { out = await billingModemSwapTaoki(input); }
         catch (e) { out = { ok: false, steps: [], error: e.message, code: e.code }; }
+        await withMapStep(out, input);
         logPush({ username: input.newUsername, swapFor: input.customer, ok: !!out.ok, steps: out.steps, error: out.error || '' });
         return send(out.ok ? 200 : out.code === 'IN_USE' ? 409 : 502, out);
       }
       const r = await newBillingFetch('/api/modem-swap', { method: 'POST', body: input, passThrough: true, timeout: 60000 });
       const out = Object.assign({ ok: false, steps: [] }, r.body || {});
+      await withMapStep(out, input);
       logPush({ username: input.newUsername, swapFor: input.customer, ok: !!out.ok, steps: out.steps, error: out.error || '' });
       return send(out.ok ? 200 : 502, out);
     } catch (e) {
