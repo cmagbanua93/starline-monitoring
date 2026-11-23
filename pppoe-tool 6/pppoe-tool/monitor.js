@@ -246,6 +246,7 @@ function stripTags(html) {
 
 /* Both poll commands over ONE SSH connection: a RouterOS SSH handshake costs more
    than the commands themselves, and two connections every 30 s added up. */
+const SSH_EXEC_MS = Math.max(10, parseInt(process.env.SSH_EXEC_TIMEOUT_SECONDS || '45', 10)) * 1000;
 async function sshExecMany(commands) {
   const ssh = new NodeSSH();
   try {
@@ -261,7 +262,7 @@ async function sshExecMany(commands) {
     });
     const out = [];
     for (const command of commands) {
-      const result = await ssh.execCommand(command);
+      const result = await withLimit(ssh.execCommand(command), SSH_EXEC_MS, 'a router command');
       if (result.code !== 0 && result.stderr) throw new Error(`router returned an error for "${command}": ${result.stderr.trim()}`);
       out.push(result.stdout);
     }
@@ -293,7 +294,7 @@ async function sshExec(command) {
         hmac: ['hmac-sha2-256', 'hmac-sha1'],
       },
     });
-    const result = await ssh.execCommand(command);
+    const result = await withLimit(ssh.execCommand(command), SSH_EXEC_MS, 'a router command');
     if (result.code !== 0 && result.stderr) {
       throw new Error(`router returned an error for "${command}": ${result.stderr.trim()}`);
     }
@@ -1645,11 +1646,24 @@ const SERVICE_MAX_AGE_MS = Math.max(15, parseInt(process.env.MONITOR_SERVICE_MAX
 let pollInFlight = null, pollTimer = null;
 const pollAgeMs = () => state.lastPoll ? Date.now() - new Date(state.lastPoll).getTime() : Infinity;
 const pollEveryMs = () => (sseClients.size ? POLL_INTERVAL_MS : IDLE_POLL_MS);
+/* A poll that never finishes (the router or billing stops answering mid-way) must
+   not stop every poll after it: on 23 Nov one hung and the monitor stayed on 02:56
+   data for hours, so ticketing's PPPoE search timed out. Each part gets a limit. */
+const POLL_MAX_MS = Math.max(30, parseInt(process.env.MONITOR_POLL_MAX_SECONDS || '90', 10)) * 1000;
+function withLimit(promise, ms, what) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${what} took longer than ${Math.round(ms / 1000)} s — skipped, retrying on the next poll`)), ms); }),
+  ]).finally(() => clearTimeout(timer));
+}
 function pollNow() {
   if (!pollInFlight) {
     clearTimeout(pollTimer); pollTimer = null;
-    pollInFlight = Promise.allSettled([pollRouter(), pollIsps()])
-      .finally(() => { pollInFlight = null; scheduleNextPoll(); });
+    pollInFlight = Promise.allSettled([
+      withLimit(pollRouter(), POLL_MAX_MS, 'the router poll').catch(e => { state.pollError = e.message; console.error('[poll]', e.message); }),
+      withLimit(pollIsps(), POLL_MAX_MS, 'the ISP check').catch(e => console.error('[poll]', e.message)),
+    ]).finally(() => { pollInFlight = null; scheduleNextPoll(); });
   }
   return pollInFlight;
 }
@@ -1664,8 +1678,11 @@ function scheduleNextPoll() {
   pollTimer = setTimeout(pollNow, wait);
 }
 /* Make sure the data is no older than maxAgeMs, polling now if it is. */
+/* Waits for a poll only up to FRESH_WAIT_MS: a slow router or billing export must not
+   keep ticketing waiting past its own timeout — it then gets the latest data we have. */
+const FRESH_WAIT_MS = Math.max(1, parseInt(process.env.MONITOR_FRESH_WAIT_SECONDS || '8', 10)) * 1000;
 async function freshWithin(maxAgeMs) {
-  if (pollAgeMs() > maxAgeMs) await pollNow();
+  if (pollAgeMs() > maxAgeMs) await Promise.race([pollNow(), new Promise(r => setTimeout(r, FRESH_WAIT_MS))]);
 }
 
 /* The router's address and port never reach a browser: replace them (and any
