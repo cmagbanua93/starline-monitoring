@@ -907,7 +907,48 @@ async function billingAddArea(rawName) {
  * Order is fixed and each step is verified before the next: details, then
  * billing, then the plan. TaokiNinam sends the welcome SMS at the end of that
  * chain, so a half-finished record must never reach step three. */
+/* ---- turning a re-used modem's account back on ----
+   A modem pulled out from a subscriber who stopped paying still carries that
+   account, and TaokiNinam disabled it on the MikroTik for non-payment (X flag).
+   Giving it to a new subscriber in billing does not switch it back on, so the
+   new subscriber had no internet (sl156 → Quennie Spence, 25 Nov). Once billing
+   has accepted the account for the new subscriber, enable it here. */
+async function routerEnableForNewOwner(name, comment) {
+  if (!PPPOE_NAME_RE.test(name || '')) return { step: 'router', status: 'skipped', detail: 'no valid PPPoE username' };
+  if (!SSH_HOST || !SSH_USER) return { step: 'router', status: 'skipped', detail: `MikroTik not configured here — enable ${name} by hand if it is disabled` };
+  try {
+    const rows = parseTerse(await sshExec(`/ppp secret print terse where name="${name}"`)).filter(r => String(r.name || '').toLowerCase() === name.toLowerCase());
+    if (!rows.length) return { step: 'router', status: 'failed', detail: `${name} is not on the MikroTik — create the PPPoE secret first` };
+    const wasDisabled = /X/.test(rows[0].__flags || '') || String(rows[0].disabled || '') === 'yes';
+    const note = String(comment || '').replace(/[^A-Za-z0-9 ._\/:-]/g, '').slice(0, 120);
+    if (!wasDisabled) return { step: 'router', status: 'done', detail: `${name} is enabled on the MikroTik` };
+    const cmds = [`/ppp secret set [find where name="${name}"] disabled=no${note ? ' comment=' + rosStr(note) : ''}`];
+    /* a session still up under the old settings is dropped so the modem reconnects at once */
+    if (wasDisabled) cmds.push(`/ppp active remove [find where name="${name}"]`);
+    await sshExecMany(cmds);
+    const after = parseTerse(await sshExec(`/ppp secret print terse where name="${name}"`)).find(r => String(r.name || '').toLowerCase() === name.toLowerCase()) || {};
+    if (/X/.test(after.__flags || '') || String(after.disabled || '') === 'yes')
+      return { step: 'router', status: 'failed', detail: `${name} is still disabled on the MikroTik — enable it in Winbox` };
+    state.accounts.forEach(a => { if (String(a.username || '').toLowerCase() === name.toLowerCase()) a.disabled = false; });
+    return { step: 'router', status: 'done', detail: wasDisabled ? `${name} was disabled on the MikroTik (old subscriber's non-payment) — enabled, internet on` : `${name} is enabled on the MikroTik` };
+  } catch (e) {
+    return { step: 'router', status: 'failed', detail: `could not enable ${name} on the MikroTik: ${e.message} — enable it in Winbox` };
+  }
+}
+
 async function billingPush(input) {
+  const out = await billingPushInner(input);
+  /* TaokiNinam only: the new billing turns the router secret on itself */
+  if (!USE_NEW_BILLING && out && out.ok) {
+    const who = [input.fname, input.lname].filter(Boolean).join(' ');
+    const r = await routerEnableForNewOwner(input.username, `${out.accountNo || ''} ${who}`.trim());
+    out.steps.push(r);
+    if (r.status === 'failed') { out.ok = false; out.error = r.detail; }
+    logPush({ username: input.username, id: out.recordId, ok: r.status !== 'failed', steps: [r], note: 'router after install' });
+  }
+  return out;
+}
+async function billingPushInner(input) {
   if (USE_NEW_BILLING) {
     const r = await newBillingFetch('/api/installs', { method: 'POST', body: input, passThrough: true, timeout: 60000 });
     const out = Object.assign({ ok: false, steps: [] }, r.body || {});
@@ -1393,6 +1434,9 @@ async function billingModemSwapTaoki(input) {
   } else if (oldName) {
     steps.push({ step: 'router-name', status: 'skipped', detail: `${oldName} was not found on the MikroTik before the change` });
   }
+
+  /* the replacement modem's account (often from a deactivated subscriber, so disabled) goes on */
+  steps.push(await routerEnableForNewOwner(newUser, `${sub.account || ''} ${subName}`.trim()));
 
   enrichCache = null;               // dashboards pick up the new name on the next poll
   const ok = steps.every(s => s.status !== 'failed');
