@@ -3602,6 +3602,128 @@ async function ftthNetwork() {
   return net;
 }
 
+/* ---------------- modem pulled out (TaokiNinam) ----------------
+ * A subscriber who stopped paying (or cancelled) has the modem taken back:
+ *   1. billing: their TaokiNinam record's billing is switched OFF, so no more
+ *      monthly bills pile up (what they owe stays on the record);
+ *   2. router: the PPPoE secret is disabled, the session dropped, and it is
+ *      labelled as a spare — same name, ready for the next subscriber;
+ *   3. map: their pin is marked disconnected (NAP port freed if the drop was removed).
+ * A modem pulled out because it is DEFECTIVE leaves billing and the router alone
+ * (the subscriber still pays; the replacement is a repair with a modem swap).
+ * Retry-safe: each step checks first. */
+const PULLOUT_STOP = /non.?payment|unpaid|cancel|moved|terminat/i;
+async function billingSwitchOffTaoki(rec) {
+  if (!billingIsActive(rec)) return { step: 'billing', status: 'skipped', detail: `billing is already off for ${rec.username}` };
+  const id = rec.id;
+  /* TaokiNinam's own control for this: a billing form/button on the record's page
+     that switches billing off. Its exact shape is not known here, so look for it
+     and check the result in the export rather than assume. */
+  const html = await billingGet(`/recordDetails.php?id=${encodeURIComponent(id)}`);
+  const tried = [];
+  const formRe = /<form\b([^>]*)>([\s\S]*?)<\/form>/gi;
+  let m;
+  while ((m = formRe.exec(html))) {
+    const act = (/action\s*=\s*["']([^"']+)["']/i.exec(m[1]) || [])[1] || '';
+    if (!/billing|deactiv|disable/i.test(act)) continue;
+    /* only a form whose own button says it switches billing off — never the activation form */
+    const offBtn = /<(?:button|input)\b[^>]*>?[^<]{0,40}?(deactivat|disable billing|turn off|stop billing|billing off)/i.test(m[2]);
+    if (!offBtn) continue;
+    const fields = parseFormFields(`<form${m[1]}>${m[2]}</form>`, '') || {};
+    /* the switch-off button's own name/value, as a browser would send it */
+    const btnRe = /<(button|input)\b([^>]*)>([^<]{0,60})/gi;
+    let bt;
+    while ((bt = btnRe.exec(m[2]))) {
+      const tagAttrs = bt[2], label = bt[3] + ' ' + ((/value\s*=\s*["']([^"']*)["']/i.exec(tagAttrs) || [])[1] || '');
+      if (!/deactivat|disable billing|turn off|stop billing|billing off/i.test(label)) continue;
+      const nm = (/name\s*=\s*["']([^"']+)["']/i.exec(tagAttrs) || [])[1];
+      const vl = (/value\s*=\s*["']([^"']*)["']/i.exec(tagAttrs) || [])[1];
+      if (nm) fields[nm] = vl || '';
+      break;
+    }
+    const url = act.startsWith('/') ? act : '/' + act.replace(/^\.\.?\//, '');
+    const r = await billingPost(url.includes('id=') ? url : `${url}${url.includes('?') ? '&' : '?'}id=${encodeURIComponent(id)}`, Object.assign({ submit: fields.submit || 'Submit' }, fields));
+    tried.push(`${url} (HTTP ${r.status})`);
+    const after = await billingFindRecord(rec.username);
+    if (!billingIsActive(after)) return { step: 'billing', status: 'done', http: r.status, detail: `billing switched off for ${[rec.fname, rec.lname].filter(Boolean).join(' ') || rec.username}${rec.account ? ' (account ' + rec.account + ')' : ''} — what they owe stays on the record` };
+  }
+  /* links such as deactivate.php?id=… */
+  const linkRe = /href\s*=\s*["']([^"']*(?:deactivat|disablebilling|billingoff|stopbilling)[^"']*)["']/gi;
+  while ((m = linkRe.exec(html))) {
+    const href = m[1].replace(/&amp;/g, '&');
+    if (!href.includes(String(id))) continue;
+    await billingGet(href.startsWith('/') ? href : '/' + href.replace(/^\.\.?\//, ''));
+    tried.push(href.split('?')[0]);
+    const after = await billingFindRecord(rec.username);
+    if (!billingIsActive(after)) return { step: 'billing', status: 'done', detail: `billing switched off for ${rec.username}` };
+  }
+  return { step: 'billing', status: 'failed', detail: `could not switch billing off automatically${tried.length ? ' (tried ' + tried.join(', ') + ')' : ' — no switch-off control found on the record page'} — in TaokiNinam, open ${rec.account || rec.username} and switch billing off by hand` };
+}
+async function routerPulloutSpare(name, note) {
+  if (!SSH_HOST || !SSH_USER) return { step: 'router', status: 'skipped', detail: `MikroTik not configured here — disable ${name} by hand` };
+  try {
+    const rows = parseTerse(await sshExec(`/ppp secret print terse where name="${name}"`)).filter(r => String(r.name || '').toLowerCase() === name.toLowerCase());
+    if (!rows.length) return { step: 'router', status: 'failed', detail: `${name} is not on the MikroTik` };
+    const label = String(note || '').replace(/[^A-Za-z0-9 ._\/:-]/g, '').slice(0, 120);
+    await sshExecMany([
+      `/ppp secret set [find where name="${name}"] disabled=yes comment=${rosStr(label)}`,
+      `/ppp active remove [find where name="${name}"]`,
+    ]);
+    const after = parseTerse(await sshExec(`/ppp secret print terse where name="${name}"`)).find(r => String(r.name || '').toLowerCase() === name.toLowerCase()) || {};
+    const off = /X/.test(after.__flags || '') || String(after.disabled || '') === 'yes';
+    if (!off) return { step: 'router', status: 'failed', detail: `${name} still reads enabled on the MikroTik — disable it in Winbox` };
+    state.accounts.forEach(a => { if (String(a.username || '').toLowerCase() === name.toLowerCase()) a.disabled = true; });
+    return { step: 'router', status: 'done', detail: `${name} disabled on the MikroTik and kept as a spare (same name) — "${label}"` };
+  } catch (e) {
+    return { step: 'router', status: 'failed', detail: `could not reach the MikroTik: ${e.message} — disable ${name} in Winbox` };
+  }
+}
+async function ftthPullout(input) {
+  if (!FTTH_URL || !FTTH_TOKEN) return { step: 'map', status: 'skipped', detail: 'the FTTH map is not linked to the monitor — mark the pin disconnected by hand' };
+  try {
+    const r = await fetch(FTTH_URL + '/api/pppoe-pullout', {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': FTTH_TOKEN },
+      body: JSON.stringify({ username: input.username, reason: input.reason, ticketId: input.ticketId || '', freePort: !!input.dropRemoved }),
+      signal: AbortSignal.timeout(20000),
+    });
+    const out = await r.json().catch(() => ({}));
+    if (r.status === 404) return { step: 'map', status: 'skipped', detail: 'the FTTH map does not have the pull-out update yet — mark the pin disconnected by hand' };
+    if (!r.ok || !out.ok) return { step: 'map', status: 'failed', detail: `map not updated: ${out.error || 'HTTP ' + r.status}` };
+    ftthCache = { at: 0, net: null };
+    return { step: 'map', status: out.status === 'done' ? 'done' : 'skipped', detail: out.detail };
+  } catch (e) {
+    return { step: 'map', status: 'failed', detail: `could not reach the FTTH map (${e.message})` };
+  }
+}
+async function billingPullout(input) {
+  const username = String(input.username || '').trim().toLowerCase();
+  const reason = String(input.reason || '').trim();
+  if (!PPPOE_NAME_RE.test(username)) return { ok: false, steps: [], error: `"${input.username}" is not a valid PPPoE username` };
+  const steps = [];
+  if (!PULLOUT_STOP.test(reason)) {
+    steps.push({ step: 'billing', status: 'skipped', detail: `reason "${reason || '—'}": the subscriber keeps billing and their account — nothing changed (a replacement is done as a repair with a modem swap)` });
+    return { ok: true, steps };
+  }
+  let rec = null;
+  if (!USE_NEW_BILLING && BILLING_ENABLED) {
+    try { rec = await billingFindRecord(username); }
+    catch (e) { steps.push({ step: 'billing', status: 'failed', detail: e.message + ' — switch billing off by hand' }); }
+    if (rec) {
+      try { steps.push(await billingSwitchOffTaoki(rec)); }
+      catch (e) { steps.push({ step: 'billing', status: 'failed', detail: `TaokiNinam did not answer: ${e.message} — switch billing off by hand` }); }
+    }
+  } else {
+    steps.push({ step: 'billing', status: 'skipped', detail: 'not on TaokiNinam — switch billing off in billing' });
+  }
+  const who = rec ? `${rec.account || ''} ${[rec.fname, rec.lname].filter(Boolean).join(' ')}`.trim() : '';
+  const day = new Date(Date.now() + 8 * 3600000).toISOString().slice(0, 10);
+  steps.push(await routerPulloutSpare(username, `spare - pulled out from ${who || 'subscriber'}, ${reason}, ${day}`));
+  steps.push(await ftthPullout({ ...input, username }));
+  enrichCache = null;
+  const ok = steps.every(x => x.status !== 'failed');
+  return { ok, steps, error: ok ? '' : 'something still needs doing by hand (see the steps)' };
+}
+
 /* Modem swap on a repair: move the subscriber's pin on the FTTH map to the new
    modem's PPPoE account, the same change billing just made. Returns one step. */
 async function ftthPppoeSwap(input) {
@@ -3919,6 +4041,20 @@ async function handleRequest(req, res) {
     const st = await ftthPppoeSwap(input);
     out.steps.push(st);
     if (st.status === 'failed') { out.ok = false; out.error = 'billing was updated, but the FTTH map was not (see the map step)'; }
+  }
+
+  if (path === '/api/billing-pullout') {
+    const send = (code, body) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(body)); };
+    if (req.method !== 'POST') return send(405, { error: 'POST only' });
+    if (!API_TOKEN || !keyMatches(req.headers['x-api-key'] || '')) return send(401, { error: 'Not authorised' });
+    try {
+      const input = await readJson(req);
+      const out = await billingPullout(input);
+      logPush({ username: input.username, pullout: input.reason || '', ok: !!out.ok, steps: out.steps, error: out.error || '' });
+      return send(out.ok ? 200 : 502, out);
+    } catch (e) {
+      return send(502, { ok: false, steps: [], error: describeFetchError(e) });
+    }
   }
 
   if (path === '/api/billing-modem-swap') {
